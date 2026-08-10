@@ -1,14 +1,18 @@
 // The pricing source.
 //
-// Cost is taken from opencode's own models.dev-backed catalog — fetched via
-// the plugin client (no external network, always the catalog version opencode
-// itself runs) — matched to the LiteLLM model by name.
+// Cost is taken from the models.dev price table — fetched once and cached on
+// disk — matched to the LiteLLM model by name. See load() for why it is not
+// read from opencode's own copy: doing so deadlocks plugin startup, and its
+// list only covers providers the reader happens to have configured.
 //
 // LiteLLM's own per-model prices are deliberately not used: they depend on the
 // deployment having base_model set correctly, which is easy to get wrong and
 // then silently bills $0. Name-matching gives the same answer for every key,
 // through one code path.
 
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { tmpdir } from 'node:os'
 import type { PluginInput } from '@opencode-ai/plugin'
 import type { CostBlock, CostTier } from './types.ts'
 
@@ -63,7 +67,7 @@ interface Candidate {
   fields: CatalogFields
 }
 
-const CATALOG_TIMEOUT_MS = 30_000
+const CATALOG_TIMEOUT_MS = 10_000
 
 let catalogPromise: Promise<Catalog | null> | undefined
 let catalogStatus: CatalogStatus = { state: 'loading' }
@@ -88,46 +92,18 @@ export function getCatalog(client: Client): Promise<Catalog | null> {
 }
 
 /**
- * Reject after CATALOG_TIMEOUT_MS so a hung client call can't leak forever.
+ * Load the catalog before the `config` hook runs. Never throws.
  *
- * This is a leak guard, not a startup guard: nothing awaits the load any more.
- * `client.config.providers()` is served by the same process that is loading
- * plugins and building the config, so it cannot answer while a plugin is
- * blocked waiting on it — measured against a live server, an awaited call
- * timed out at 2002 ms while the same call, left unawaited, resolved at
- * 2154 ms, immediately after the `config` hook returned. Awaiting it during
- * startup is a deadlock at any timeout value, which is why startCatalogLoad
- * fires it and walks away.
+ * Awaited, and safe to await: the fetch goes to models.dev, not to the opencode
+ * server that is loading this plugin. Awaiting the latter is what deadlocked.
+ * It has to finish first, because the hook is invoked exactly once — there is
+ * no second pass to fill prices in on.
  */
-function withTimeout<T>(p: Promise<T>): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  return Promise.race([
-    p,
-    new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new Error('catalog load timed out')), CATALOG_TIMEOUT_MS)
-    }),
-  ]).finally(() => {
-    if (timer) clearTimeout(timer)
-  }) as Promise<T>
+export async function preloadCatalog(client: Client): Promise<void> {
+  await getCatalog(client)
 }
 
-/**
- * Kick the catalog load off without waiting for it. Never throws.
- *
- * Deliberately not awaited — see withTimeout above. The `config` hook runs
- * several times per run, so a load started here lands in time for a later
- * invocation to price what the first one could only inject bare.
- */
-export function startCatalogLoad(client: Client): void {
-  void getCatalog(client)
-}
-
-/**
- * The catalog if it has already finished loading, else null.
- *
- * Callers on the startup path must use this rather than awaiting getCatalog:
- * awaiting is what deadlocks.
- */
+/** The catalog if loaded, else null. */
 export function catalogIfReady(): Catalog | null {
   return readyCatalog
 }
@@ -139,101 +115,120 @@ export function resetCatalogCache(): void {
   readyCatalog = null
 }
 
+/** models.dev's published price table. */
+const MODELS_DEV_URL = 'https://models.dev/api.json'
+
+/** Where the last good copy is kept, so a cold start still prices offline. */
+function cachePath(): string {
+  const base = process.env.XDG_CACHE_HOME ?? join(process.env.HOME ?? tmpdir(), '.cache')
+  return join(base, 'opencode-plugin-litellm-pricing', 'models-dev.json')
+}
+
+/** Serve the cache without re-fetching for this long. */
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000
+
 /**
- * Where the price table comes from, best first.
- *
- * `provider.list` (/provider) returns `all`: every models.dev provider,
- * independent of what the user has configured or authenticated. That is what a
- * price table needs. `config.providers` returns only configured/detected
- * providers — on a machine with no Azure credentials it omits `azure`
- * entirely, and the `openai` entry it does return is the user's own, which
- * reports every cost as 0. Sourcing prices from it means a model priced $0 by
- * accident of the reader's config, which is the exact failure this plugin
- * exists to prevent. It stays only as a fallback for hosts without /provider.
- *
- * It has a second, load-bearing role. Nothing here can be awaited during
- * plugin load: the server that answers these calls cannot answer anything
- * while a plugin blocks on it, so awaiting either endpoint deadlocks until the
- * timeout — measured at 60 s for both. The catalog therefore lands after the
- * first `config` pass has already injected models bare, and only a LATER pass
- * can price them. Requesting config.providers is what prompts opencode to
- * rebuild the config and run that later pass; with provider.list alone the
- * hook is invoked exactly once and the prices never get in.
- *
- * Both endpoints return the same nested model shape at runtime
- * (`capabilities.toolcall`, `cost.cache.read`, `experimentalOver200K`), so
- * `toCatalogFields` parses either. Note the SDK's generated type for /provider
- * describes a flatter shape than the server actually sends; the shape below is
- * what a live 1.18 server returns.
+ * models.dev ships its table as an object keyed by provider id; buildFromProviders
+ * wants a list. `id` is already on each entry, but default it from the key so an
+ * entry without one still lands under the right provider.
  */
-const SOURCES: Array<{ name: string; fetch: (client: Client) => Promise<unknown> }> = [
-  {
-    name: 'provider.list',
-    fetch: async (client) => {
-      const r = (await client.provider.list({})) as unknown as {
-        data?: { all?: unknown }
-        all?: unknown
-      }
-      return r?.data?.all ?? r?.all
-    },
-  },
-  {
-    name: 'config.providers',
-    fetch: async (client) => {
-      const r = (await client.config.providers({})) as unknown as {
-        data?: { providers?: unknown }
-        providers?: unknown
-      }
-      return r?.data?.providers ?? r?.providers
-    },
-  },
-]
+function toProviderList(raw: unknown): unknown[] | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  return Object.entries(raw as Record<string, Record<string, unknown>>).map(([id, p]) => ({
+    ...p,
+    id: typeof p?.id === 'string' ? p.id : id,
+  }))
+}
 
-async function load(client: Client): Promise<Catalog | null> {
-  const t0 = Date.now()
-  // Fired together, not in sequence. Sequencing would make the fallback wait
-  // out the primary's timeout, and the window in which a later `config` pass
-  // can still use the result is short — see startCatalogLoad.
-  const attempts = await Promise.all(
-    SOURCES.map(async (source) => {
-      try {
-        const providers = await withTimeout(source.fetch(client))
-        if (!Array.isArray(providers))
-          return { source, reason: 'no provider list in response', catalog: null }
-        const catalog = buildFromProviders(providers)
-        // Providers we can't price are no better than no providers.
-        if (catalog.candidateCount === 0)
-          return { source, reason: 'no priceable providers', catalog: null }
-        return { source, reason: '', catalog }
-      } catch (err) {
-        return {
-          source,
-          reason: err instanceof Error ? err.message : String(err),
-          catalog: null,
-        }
-      }
-    }),
-  )
-
-  // SOURCES order is preference order, so the first success wins.
-  const won = attempts.find((a) => a.catalog)
-  if (won?.catalog) {
-    catalogStatus = {
-      state: 'ok',
-      source: won.source.name,
-      elapsedMs: Date.now() - t0,
-      candidateCount: won.catalog.candidateCount,
-      matchedProviders: won.catalog.matchedProviders,
-    }
-    return won.catalog
+async function readCache(): Promise<{ providers: unknown[]; ageMs: number } | null> {
+  try {
+    const path = cachePath()
+    const [text, info] = await Promise.all([readFile(path, 'utf8'), stat(path)])
+    const providers = toProviderList(JSON.parse(text))
+    if (!providers) return null
+    return { providers, ageMs: Date.now() - info.mtimeMs }
+  } catch {
+    return null
   }
+}
+
+async function writeCache(text: string): Promise<void> {
+  try {
+    const path = cachePath()
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, text, 'utf8')
+  } catch {
+    // A cache we cannot write is not a reason to fail the load.
+  }
+}
+
+/** Build a catalog from a provider list, or null if nothing in it is priceable. */
+function catalogFrom(providers: unknown[]): Catalog | null {
+  const catalog = buildFromProviders(providers)
+  return catalog.candidateCount > 0 ? catalog : null
+}
+
+function ok(catalog: Catalog, source: string, t0: number): Catalog {
   catalogStatus = {
-    state: 'unavailable',
-    reason:
-      `${attempts.map((a) => `${a.source.name}: ${a.reason}`).join('; ')} ` +
-      `(after ${Date.now() - t0}ms)`,
+    state: 'ok',
+    source,
+    elapsedMs: Date.now() - t0,
+    candidateCount: catalog.candidateCount,
+    matchedProviders: catalog.matchedProviders,
   }
-  return null
+  return catalog
+}
+
+/**
+ * Load the price table.
+ *
+ * Fetched from models.dev directly rather than through opencode's client. That
+ * is not a preference. opencode's server cannot answer a request while a plugin
+ * is blocked waiting on it, so awaiting its provider list during plugin load
+ * deadlocks — measured at 60 s for both `provider.list` and `config.providers`,
+ * while the identical call left unawaited returned in 351 ms, right after the
+ * `config` hook had already run. And that hook is invoked exactly once, under
+ * `serve` and the CLI alike, so there is no later pass to price into. An
+ * ordinary HTTPS fetch has no such dependency and can simply be awaited.
+ *
+ * models.dev is also the more correct source: it carries every provider,
+ * whereas `config.providers` carries only the ones the reader has configured. A
+ * machine with no Azure credentials has no `azure` entry at all, and the
+ * `openai` entry it does have reports every cost as 0 — pricing from that would
+ * report $0 by accident of the reader's config, the exact failure this plugin
+ * exists to prevent.
+ */
+async function load(_client: Client): Promise<Catalog | null> {
+  const t0 = Date.now()
+
+  // A fresh cache is authoritative: it keeps startup off the network entirely.
+  const cached = await readCache()
+  if (cached && cached.ageMs < CACHE_TTL_MS) {
+    const catalog = catalogFrom(cached.providers)
+    if (catalog) return ok(catalog, 'cache', t0)
+  }
+
+  try {
+    const res = await fetch(MODELS_DEV_URL, { signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS) })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const text = await res.text()
+    const providers = toProviderList(JSON.parse(text))
+    if (!providers) throw new Error('unexpected response shape')
+    const catalog = catalogFrom(providers)
+    if (!catalog) throw new Error('no priceable providers')
+    await writeCache(text)
+    return ok(catalog, MODELS_DEV_URL, t0)
+  } catch (err) {
+    // A stale table still prices far better than showing $0.
+    const stale = cached && catalogFrom(cached.providers)
+    if (stale) return ok(stale, 'stale cache', t0)
+    catalogStatus = {
+      state: 'unavailable',
+      source: MODELS_DEV_URL,
+      reason: `${err instanceof Error ? err.message : String(err)} after ${Date.now() - t0}ms`,
+    }
+    return null
+  }
 }
 
 /**
@@ -316,12 +311,25 @@ function toCatalogFields(m: Record<string, unknown>): CatalogFields {
   const output = num(limit?.output)
   if (context != null && output != null) fields.limit = { context, output }
 
+  // Two shapes in play. models.dev publishes capabilities flat
+  // (`tool_call`, `modalities.input: string[]`); opencode's own provider list
+  // nests them (`capabilities.toolcall`, `capabilities.input` as booleans).
+  // Read either, because a field read off the wrong shape yields undefined and
+  // silently drops the capability.
   const caps = m.capabilities as Record<string, unknown> | undefined
-  if (caps?.reasoning === true) fields.reasoning = true
-  if (caps?.toolcall === true) fields.tool_call = true
-  if (caps?.attachment === true) fields.attachment = true
+  if (caps?.reasoning === true || m.reasoning === true) fields.reasoning = true
+  if (caps?.toolcall === true || m.tool_call === true) fields.tool_call = true
+  if (caps?.attachment === true || m.attachment === true) fields.attachment = true
 
-  const modalities = toModalities(caps?.input as Record<string, unknown> | undefined)
+  const flatModalities = m.modalities as { input?: unknown; output?: unknown } | undefined
+  const modalities = Array.isArray(flatModalities?.input)
+    ? {
+        input: flatModalities.input.filter((x): x is string => typeof x === 'string'),
+        output: Array.isArray(flatModalities.output)
+          ? flatModalities.output.filter((x): x is string => typeof x === 'string')
+          : ['text'],
+      }
+    : toModalities(caps?.input as Record<string, unknown> | undefined)
   if (modalities) fields.modalities = modalities
 
   return fields
@@ -331,27 +339,45 @@ function toCatalogFields(m: Record<string, unknown>): CatalogFields {
 // so they map straight through — no ×1e6 scaling.
 function toCost(raw: unknown): CostBlock | undefined {
   const cost = raw as
-    | { input?: unknown; output?: unknown; cache?: { read?: unknown; write?: unknown }; experimentalOver200K?: unknown }
+    | {
+        input?: unknown
+        output?: unknown
+        cache?: { read?: unknown; write?: unknown }
+        cache_read?: unknown
+        cache_write?: unknown
+        tiers?: unknown
+        experimentalOver200K?: unknown
+      }
     | undefined
   const input = num(cost?.input)
   const output = num(cost?.output)
   if (input == null || output == null) return undefined
 
   const block: CostBlock = { input, output }
-  const cacheRead = num(cost?.cache?.read)
-  const cacheWrite = num(cost?.cache?.write)
+  // Flat (`cache_read`, models.dev) or nested (`cache.read`, opencode).
+  const cacheRead = num(cost?.cache?.read) ?? num(cost?.cache_read)
+  const cacheWrite = num(cost?.cache?.write) ?? num(cost?.cache_write)
   if (cacheRead) block.cache_read = cacheRead
   if (cacheWrite) block.cache_write = cacheWrite
 
-  const over = cost?.experimentalOver200K as
-    | { input?: unknown; output?: unknown; cache?: { read?: unknown; write?: unknown } }
+  // The over-200k tier is `experimentalOver200K` in opencode's list and the
+  // first entry of `cost.tiers` in models.dev's.
+  const tiers = Array.isArray(cost?.tiers) ? cost.tiers : []
+  const over = (cost?.experimentalOver200K ?? tiers[0]) as
+    | {
+        input?: unknown
+        output?: unknown
+        cache?: { read?: unknown; write?: unknown }
+        cache_read?: unknown
+        cache_write?: unknown
+      }
     | undefined
   const overIn = num(over?.input)
   const overOut = num(over?.output)
   if (overIn != null && overOut != null) {
     const tier: CostTier = { input: overIn, output: overOut }
-    const tr = num(over?.cache?.read)
-    const tw = num(over?.cache?.write)
+    const tr = num(over?.cache?.read) ?? num(over?.cache_read)
+    const tw = num(over?.cache?.write) ?? num(over?.cache_write)
     if (tr) tier.cache_read = tr
     if (tw) tier.cache_write = tw
     block.context_over_200k = tier

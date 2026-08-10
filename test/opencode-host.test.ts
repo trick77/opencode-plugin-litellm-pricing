@@ -9,11 +9,15 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Config } from '@opencode-ai/plugin'
 import { resetCatalogCache } from '../src/catalog.ts'
 import { resetReportedCatalog } from '../src/plugin.ts'
 import {
   CATALOG_PROVIDERS,
+  MODELS_DEV_TABLE,
   captureConsole,
   fakePluginInput,
   json,
@@ -37,36 +41,28 @@ async function runConfigHook(
   routes: Routes,
   opts: {
     catalogProviders?: unknown[]
-    catalogAll?: unknown[]
-    noProviderList?: boolean
     logged?: LoggedEntry[]
     logFails?: boolean
-    /** Run the hook once, before the catalog can land. */
-    singlePass?: boolean
   } = {},
 ) {
   resetCatalogCache()
   resetReportedCatalog()
+  // The catalog is cached on disk between runs. Point that at a throwaway dir
+  // so the suite can neither read the developer's cache nor write to it —
+  // otherwise these scenarios pass or fail depending on the host machine.
+  process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), 'litellm-pricing-test-'))
   const plugin = await loadTheOnePlugin()
   return captureConsole(() =>
     withFakeProxy(routes, async () => {
       const input = fakePluginInput(opts.catalogProviders ?? CATALOG_PROVIDERS, {
         logged: opts.logged,
         logFails: opts.logFails,
-        all: opts.catalogAll,
-        noProviderList: opts.noProviderList,
       })
+      // Once, because that is what opencode does — measured under both
+      // `opencode serve` and the CLI. There is no second pass to fall back on,
+      // which is why the price table has to be loaded before the hook runs.
       const hooks = await plugin(input)
-      // Two passes, because that is what opencode does — and it is load-bearing
-      // here: the catalog cannot resolve while the first pass is running (see
-      // startCatalogLoad), so pass one injects bare and pass two prices. A
-      // single-pass harness would assert against a state production never
-      // settles in.
       await hooks.config?.(config as unknown as Config)
-      if (!opts.singlePass) {
-        await new Promise((resolve) => setTimeout(resolve, 0))
-        await hooks.config?.(config as unknown as Config)
-      }
       return config
     }),
   )
@@ -143,13 +139,17 @@ test('injects discovered models with catalog pricing into the config', async () 
   assert.deepEqual(entry.limit, { context: 1050000, output: 128000 })
   // Priced from the models.dev catalog by name-match, never from the proxy.
   // No cache_write: a zero cache tier is dropped rather than reported as free.
-  assert.deepEqual(entry.cost, { input: 2.5, output: 15, cache_read: 0.25 })
+  assert.deepEqual(entry.cost, {
+    input: 2.5,
+    output: 15,
+    cache_read: 0.25,
+    context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
+  })
   assert.equal(entry.tool_call, true)
 
   assert.ok(
-    logs.some((l) => l.includes('1 discovered, 1 added')) &&
-      logs.some((l) => l.includes('catalog arrived late, priced 1/1')),
-    `expected a summary and a late-pricing line, got: ${logs.join(' | ')}`,
+    logs.some((l) => l.includes('1 discovered, 1 added, pricing for 1/1')),
+    `expected a priced summary, got: ${logs.join(' | ')}`,
   )
 })
 
@@ -199,7 +199,12 @@ test('the pre-rename provider id is still matched', async () => {
   assert.ok(entry, 'the legacy provider id should still be enriched')
   // Pricing specifically — a matched-but-unpriced entry would be the silent
   // half-failure this guarantee exists to rule out.
-  assert.deepEqual(entry.cost, { input: 2.5, output: 15, cache_read: 0.25 })
+  assert.deepEqual(entry.cost, {
+    input: 2.5,
+    output: 15,
+    cache_read: 0.25,
+    context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
+  })
 })
 
 // 3c — matching must not have become a free-for-all.
@@ -317,53 +322,12 @@ test('the summary accounts for every discovered model, and names the unpriced', 
     `expected an accounted summary, got: ${all.join(' | ')}`,
   )
   assert.ok(
-    all.some((l) => l.includes('catalog arrived late, priced 1/2')),
-    `expected the late-pricing count, got: ${all.join(' | ')}`,
+    all.some((l) => l.includes('no pricing: some-unknown-llama-thing')),
+    `expected the unpriced model named, got: ${all.join(' | ')}`,
   )
   assert.ok(
     all.some((l) => l.includes('1 non-chat hidden') && l.includes('1 wildcard ignored')),
     `expected the non-chat and wildcard clauses, got: ${all.join(' | ')}`,
-  )
-})
-
-test('the first pass injects bare rather than blocking on the catalog', async () => {
-  const baseURL = 'https://proxy-firstpass.test'
-  // The catalog call cannot be answered while this pass is running, so the
-  // models must land unpriced rather than the pass stalling or dropping them.
-  const { result, logs } = await runConfigHook(
-    providerConfig(baseURL),
-    {
-      '/v1/models': () => json({ data: MIXED_MODELS }),
-      '/model_group/info': () => json({ data: [] }),
-    },
-    { singlePass: true },
-  )
-
-  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
-    PROVIDER_KEY
-  ]!.models
-  assert.ok(models['ai-gateway-gpt-5.4'], 'the model must be in the picker even unpriced')
-  assert.equal((models['ai-gateway-gpt-5.4'] as Record<string, unknown>).cost, undefined)
-  // "pending" and "missing" must not read the same: warning here would cry
-  // wolf on every normal startup.
-  assert.ok(
-    logs.some((l) => l.includes('pricing pending')),
-    `expected a pending summary, got: ${logs.join(' | ')}`,
-  )
-})
-
-test('models unpriced by a loaded catalog are named', async () => {
-  const baseURL = 'https://proxy-unpriced.test'
-  // Third pass: by now the catalog is loaded, so discovery re-runs against it
-  // and the count alone doesn't say WHICH model reads as free.
-  const { warns, logs } = await runConfigHook(providerConfig(baseURL), {
-    '/v1/models': () => json({ data: MIXED_MODELS }),
-    '/model_group/info': () => json({ data: [] }),
-  })
-  const all = [...logs, ...warns]
-  assert.ok(
-    all.some((l) => l.includes('catalog arrived late, priced 1/2')),
-    `expected 1 of 2 priced late, got: ${all.join(' | ')}`,
   )
 })
 
@@ -412,14 +376,11 @@ test('an unavailable catalog is reported, not swallowed into silent $0', async (
   const baseURL = 'https://proxy-nocatalog.test'
   // A provider list with no azure/openai entry — the shape a catalog load
   // failure and an unusable response both collapse to today.
-  const { logs, warns } = await runConfigHook(
-    providerConfig(baseURL),
-    {
-      '/v1/models': () => json({ data: MIXED_MODELS }),
-      '/model_group/info': () => json({ data: [] }),
-    },
-    { catalogProviders: [{ id: 'some-aggregator', models: {} }] },
-  )
+  const { logs, warns } = await runConfigHook(providerConfig(baseURL), {
+    '/v1/models': () => json({ data: MIXED_MODELS }),
+    '/model_group/info': () => json({ data: [] }),
+    '/api.json': () => json({ 'some-aggregator': { id: 'some-aggregator', models: {} } }),
+  })
   const all = [...logs, ...warns]
 
   assert.ok(
@@ -446,66 +407,57 @@ test('a working catalog reports its size and source', async () => {
   // This line is what separates "the catalog never loaded" from "the catalog
   // loaded and nothing matched" — the two causes of a clean zero.
   assert.ok(
-    logs.some((l) => l.includes('catalog:') && l.includes('provider.list')),
+    logs.some((l) => l.includes('catalog:') && l.includes('models.dev')),
     `expected a catalog line, got: ${logs.join(' | ')}`,
   )
 })
 
-test('prices from /provider, not from the reader own configured providers', async () => {
+test('prices from models.dev, including the model parameters', async () => {
   const baseURL = 'https://proxy-source.test'
-  // What config.providers returns on a machine with no Azure credentials: the
-  // user's own `openai`, which reports every cost as 0. Sourcing prices from
-  // it would price a real model at $0 by accident of the reader's config.
-  const CONFIGURED = [
-    {
-      id: 'openai',
-      models: {
-        'gpt-5.4': {
-          id: 'gpt-5.4',
-          cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-          limit: { context: 1, output: 1 },
-          capabilities: { input: {} },
-        },
-      },
-    },
-  ]
-  const { result } = await runConfigHook(
-    providerConfig(baseURL),
-    {
-      '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
-      '/model_group/info': () => json({ data: [] }),
-    },
-    { catalogProviders: CONFIGURED, catalogAll: CATALOG_PROVIDERS },
-  )
+  // The price table is served in models.dev's own published shape — flat
+  // capabilities and cache costs — which is not the shape opencode's provider
+  // list uses. Both must parse, or a price silently disappears.
+  const { result } = await runConfigHook(providerConfig(baseURL), {
+    '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
+    '/model_group/info': () => json({ data: [] }),
+    '/api.json': () => json(MODELS_DEV_TABLE),
+  })
 
   const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
     PROVIDER_KEY
   ]!.models
   const entry = models['ai-gateway-gpt-5.4'] as Record<string, unknown>
-  assert.deepEqual(entry.cost, { input: 2.5, output: 15, cache_read: 0.25 })
+  assert.deepEqual(entry.cost, {
+    input: 2.5,
+    output: 15,
+    cache_read: 0.25,
+    context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
+  })
   // Context size and the other model parameters ride along on the same match.
   assert.deepEqual(entry.limit, { context: 1050000, output: 128000 })
   assert.equal(entry.tool_call, true)
   assert.equal(entry.reasoning, true)
+  assert.equal(entry.attachment, true)
+  assert.deepEqual(entry.modalities, { input: ['text', 'image', 'pdf'], output: ['text'] })
 })
 
-test('falls back to config.providers when /provider is missing', async () => {
-  const baseURL = 'https://proxy-fallback.test'
-  const { result, logs } = await runConfigHook(
-    providerConfig(baseURL),
-    {
-      '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
-      '/model_group/info': () => json({ data: [] }),
+test('a models.dev outage is reported, not swallowed into silent $0', async () => {
+  const baseURL = 'https://proxy-outage.test'
+  const { result, warns } = await runConfigHook(providerConfig(baseURL), {
+    '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
+    '/model_group/info': () => json({ data: [] }),
+    '/api.json': () => {
+      throw new Error('network down')
     },
-    { noProviderList: true },
-  )
+  })
 
   const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
     PROVIDER_KEY
   ]!.models
-  assert.ok((models['ai-gateway-gpt-5.4'] as Record<string, unknown>).cost, 'still priced')
+  // The model still reaches the picker — unpriced beats absent.
+  assert.ok(models['ai-gateway-gpt-5.4'], 'the model must still be injected')
   assert.ok(
-    logs.some((l) => l.includes('config.providers')),
-    `expected the fallback source named, got: ${logs.join(' | ')}`,
+    warns.some((l) => l.includes('catalog unavailable')),
+    `expected an explicit warning, got: ${warns.join(' | ')}`,
   )
 })

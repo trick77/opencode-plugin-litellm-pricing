@@ -5,7 +5,7 @@
 // per-model `cost` block, so opencode's cost display matches what LiteLLM
 // bills.
 //
-// Cost comes from one source: opencode's own models.dev catalog, matched to
+// Cost comes from one source: the models.dev price table, matched to
 // each model by name (public list prices). The proxy is asked what models the
 // key can see (/v1/models) and what kind of model each one is
 // (/model_group/info) — never for pricing.
@@ -38,13 +38,8 @@ import {
   normalizeBaseURL,
   resolveApiKey,
 } from './litellm-api.ts'
-import {
-  applyCatalogFields,
-  configModelFromCatalog,
-  enrichModel,
-  groupInfoToModelInfo,
-} from './build-config-model.ts'
-import { catalogIfReady, getCatalogStatus, startCatalogLoad } from './catalog.ts'
+import { configModelFromCatalog, enrichModel, groupInfoToModelInfo } from './build-config-model.ts'
+import { catalogIfReady, getCatalogStatus, preloadCatalog } from './catalog.ts'
 
 // Default provider id — kept identical to the npm package name so the
 // `plugin` and `provider` keys in opencode.json read the same.
@@ -78,16 +73,12 @@ const injectedModelIds = new Map<string, Set<string>>()
 /** How many unpriced model ids to name inline before summarising the rest. */
 const UNPRICED_LIST_LIMIT = 15
 
-/** baseURLs whose models were injected with a catalog available. */
-const pricedBaseURLs = new Set<string>()
-
 /** The catalog is loaded once per process, so report on it once too. */
 let reportedCatalog = false
 
 /** Clear the once-per-process report guard — used by tests. */
 export function resetReportedCatalog(): void {
   reportedCatalog = false
-  pricedBaseURLs.clear()
 }
 
 /**
@@ -119,18 +110,13 @@ function readCustomHeaders(options: Record<string, unknown>): Record<string, str
 }
 
 export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
-  // Start the models.dev catalog load and walk away. That call is answered by
-  // the same process that is loading this plugin, so it cannot complete while
-  // we block on it — measured on a live server, awaiting it timed out at
-  // 2002 ms while the identical unawaited call resolved at 2154 ms, the moment
-  // the `config` hook returned. Awaiting therefore deadlocks at ANY timeout,
-  // and the old 2s bound turned that into a guaranteed 2s stall that silently
-  // lost every price.
-  //
-  // So: the first `config` pass may run before the catalog exists and injects
-  // models bare. opencode calls the hook again, by which time the catalog has
-  // landed, and `reprice` fills the cost blocks in.
-  startCatalogLoad(input.client)
+  // The price table must be in hand before the `config` hook runs: opencode
+  // invokes that hook exactly ONCE (measured under both `serve` and the CLI),
+  // so there is no later pass to fill prices in on. See catalog.ts for why the
+  // table is fetched from models.dev rather than asked of opencode — asking
+  // opencode from here deadlocks, which is what used to leave every model
+  // unpriced.
+  await preloadCatalog(input.client)
 
   // Every message goes to both sinks. console reaches whoever is attached to
   // the opencode server's stdout; client.app.log is the only path into
@@ -231,31 +217,7 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
 
         const work = async () => {
           const already = injectedModelIds.get(baseURL)
-          if (already && [...already].every((id) => models[id])) {
-            // Everything we injected is still in place, so there is nothing to
-            // discover. The one reason to keep going is the deadlock above: an
-            // earlier pass ran before the catalog existed and injected these
-            // models bare, and the catalog has since landed.
-            if (!catalog || pricedBaseURLs.has(baseURL)) return
-            pricedBaseURLs.add(baseURL)
-            let filled = 0
-            for (const id of already) {
-              const entry = models[id]
-              if (!entry || entry.cost) continue
-              const fields = resolveCatalog(id)
-              if (!fields) continue
-              // Reuses the injection-time merge: it only fills absent keys, so
-              // a limit already sourced from /model_group/info survives.
-              applyCatalogFields(entry, fields)
-              if (entry.cost) filled++
-            }
-            report(
-              filled > 0 ? 'info' : 'warn',
-              `[litellm-pricing] provider "${providerId}": catalog arrived late, ` +
-                `priced ${filled}/${already.size} previously unpriced model(s).`,
-            )
-            return
-          }
+          if (already && [...already].every((id) => models[id])) return
 
           // Pricing is never requested from the proxy. LiteLLM's per-model
           // numbers depend on the deployment having base_model set correctly —
@@ -356,7 +318,6 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           }
 
           injectedModelIds.set(baseURL, addedIds)
-          if (catalog) pricedBaseURLs.add(baseURL)
 
           // Pricing coverage is stated over the models actually injected, not
           // over everything discovered: non-chat and wildcard entries never
@@ -364,13 +325,9 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           // problem. `added > 0 && priced === 0` is the systematic-failure
           // shape, so it warns rather than informs.
           report(
-            catalog && added > 0 && priced === 0 ? 'warn' : 'info',
+            added > 0 && priced === 0 ? 'warn' : 'info',
             `[litellm-pricing] provider "${providerId}": ${discovered.length} discovered, ` +
-              `${added} added, ` +
-              // Without a catalog yet this is not a coverage figure at all —
-              // the models are simply not priced *yet*, and saying "0/N" on
-              // every normal startup would cry wolf.
-              (catalog ? `pricing for ${priced}/${added}` : 'pricing pending (catalog still loading)') +
+              `${added} added, pricing for ${priced}/${added}` +
               ` (${skipped} non-chat hidden` +
               (wildcards > 0 ? `, ${wildcards} wildcard ignored` : '') +
               (preexisting > 0 ? `, ${preexisting} already present` : '') +
@@ -388,7 +345,7 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           // Name them: a count alone doesn't say which model will read as free.
           // Capped so a large proxy stays readable — the true total is already
           // in the fraction above.
-          if (catalog && unpricedIds.length > 0) {
+          if (unpricedIds.length > 0) {
             const shown = unpricedIds.slice(0, UNPRICED_LIST_LIMIT)
             const rest = unpricedIds.length - shown.length
             report(
