@@ -61,9 +61,13 @@ then `cd test/probe && opencode models`.
   sessions and is simply skipped in short ones.
 - `src/models-dev-snapshot.ts` is GENERATED — `npm run update-snapshot`, never
   hand-edit. Keep `PREFERRED_PROVIDERS` and the kept-field list in
-  `scripts/update-snapshot.mjs` in step with `catalog.ts`, and bump
+  `scripts/update-snapshot.mjs` in step with `catalog.ts` — the script CANNOT
+  import them, `catalog.ts` imports the snapshot it generates. Bump
   `CACHE_SCHEMA` when the trimmed shape changes or old caches are served as if
   complete.
+- NEVER pin an upstream price against the real snapshot in a test — it is
+  regenerated before every release, so `npm run update-snapshot` would fail the
+  suite at tag time. Pass a fixture via the harness `snapshot` option instead.
 - NEVER go back to `client.config.providers()` for cost: deadlocks (above), and
   lists only the reader's configured providers — no Azure creds → no `azure`,
   and its `openai` entry reports every cost as 0 → real models priced $0.

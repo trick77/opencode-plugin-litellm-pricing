@@ -189,9 +189,13 @@ test('the shipped snapshot round-trips into a usable catalog', async () => {
 
   assert.ok(snapshot.candidateCount > 100, `snapshot has only ${snapshot.candidateCount} models`)
   assert.deepEqual([...snapshot.matchedProviders], ['azure', 'openai'])
-  // And it prices the real thing, in the real shape.
-  assert.deepEqual(snapshot.resolve('ai-gateway-gpt-5.4')?.limit, {
-    context: 1050000,
-    output: 128000,
-  })
+  // Structural, never a pinned price: the snapshot is REGENERATED before every
+  // release, so asserting upstream's current numbers here would turn a routine
+  // `npm run update-snapshot` into a failing suite at tag time. Exact values
+  // are pinned against fixtures in the host tests instead.
+  const priced = snapshot.resolve('ai-gateway-gpt-5.4')
+  assert.ok(priced, 'the snapshot must price a gateway-prefixed model')
+  assert.ok((priced.limit?.context ?? 0) > 0, 'a matched model must carry a context limit')
+  assert.ok((priced.cost?.input ?? 0) > 0, 'a matched model must carry an input price')
+  assert.ok((priced.cost?.output ?? 0) > 0, 'a matched model must carry an output price')
 })

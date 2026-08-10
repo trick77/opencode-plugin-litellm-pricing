@@ -13,13 +13,14 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Config } from '@opencode-ai/plugin'
-import { resetCatalogCache, setSnapshotForTests } from '../src/catalog.ts'
+import { resetCatalogCache, setSnapshotForTests, settleRefreshForTests } from '../src/catalog.ts'
 import { MODELS_DEV_SNAPSHOT } from '../src/models-dev-snapshot.ts'
 import { resetReportedCatalog } from '../src/plugin.ts'
 import {
   CATALOG_PROVIDERS,
   MODELS_DEV_TABLE,
   captureConsole,
+  fetchedURLs,
   seedCache,
   fakePluginInput,
   json,
@@ -49,6 +50,13 @@ async function runConfigHook(
     seed?: { providers: unknown[]; ageMs: number; v?: number }
     /** Blank the shipped snapshot, to reach the no-table-at-all path. */
     noSnapshot?: boolean
+    /**
+     * Stand in for the shipped snapshot. Prefer this over the real file
+     * wherever exact prices are asserted: the real one is REGENERATED before
+     * every release, so pinning upstream numbers through it turns a routine
+     * `npm run update-snapshot` into a red suite at tag time.
+     */
+    snapshot?: unknown
   } = {},
 ) {
   resetCatalogCache()
@@ -57,10 +65,10 @@ async function runConfigHook(
   // so the suite can neither read the developer's cache nor write to it —
   // otherwise these scenarios pass or fail depending on the host machine.
   process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), 'litellm-pricing-test-'))
-  setSnapshotForTests(opts.noSnapshot ? {} : MODELS_DEV_SNAPSHOT)
+  setSnapshotForTests(opts.noSnapshot ? {} : (opts.snapshot ?? MODELS_DEV_SNAPSHOT))
   if (opts.seed) await seedCache(opts.seed.providers, opts.seed.ageMs, opts.seed.v)
   const plugin = await loadTheOnePlugin()
-  return captureConsole(() =>
+  const captured = await captureConsole(() =>
     withFakeProxy(routes, async () => {
       const input = fakePluginInput(opts.catalogProviders ?? CATALOG_PROVIDERS, {
         logged: opts.logged,
@@ -74,6 +82,12 @@ async function runConfigHook(
       return config
     }),
   )
+  // Settle any background refresh before the next scenario swaps
+  // XDG_CACHE_HOME out from under it — otherwise its cache write lands in the
+  // NEXT scenario's directory and quietly turns a snapshot branch into a
+  // cache hit.
+  await settleRefreshForTests()
+  return captured
 }
 
 const PROVIDER_KEY = 'opencode-plugin-litellm-pricing'
@@ -469,6 +483,13 @@ test('a fresh cache answers, without touching the network', async () => {
     logs.some((l) => l.includes('catalog:') && l.includes('from cache')),
     `expected the cache named as source, got: ${logs.join(' | ')}`,
   )
+  // Asserted, not merely arranged: the throwing route above proves nothing on
+  // its own, because a background refresh swallows whatever it throws.
+  assert.deepEqual(
+    fetchedURLs.filter((u) => u.includes('models.dev')),
+    [],
+    'a fresh cache must not reach models.dev at all',
+  )
 })
 
 test('a stale cache still answers immediately, refreshing behind it', async () => {
@@ -513,11 +534,18 @@ test('prices from models.dev, including the model parameters', async () => {
   // The price table is served in models.dev's own published shape — flat
   // capabilities and cache costs — which is not the shape opencode's provider
   // list uses. Both must parse, or a price silently disappears.
-  const { result } = await runConfigHook(providerConfig(baseURL), {
-    '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
-    '/model_group/info': () => json({ data: [] }),
-    '/api.json': () => json(MODELS_DEV_TABLE),
-  })
+  // With a snapshot in hand the fetch is never reached, so blank it: otherwise
+  // this scenario silently asserts against the shipped snapshot instead of the
+  // served table, and `/api.json` below is never requested at all.
+  const { result } = await runConfigHook(
+    providerConfig(baseURL),
+    {
+      '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
+      '/model_group/info': () => json({ data: [] }),
+      '/api.json': () => json(MODELS_DEV_TABLE),
+    },
+    { noSnapshot: true },
+  )
 
   const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
     PROVIDER_KEY
@@ -541,12 +569,20 @@ test('a models.dev outage costs nothing: the shipped snapshot prices anyway', as
   const baseURL = 'https://proxy-outage.test'
   // On a fresh install with no cache, this used to be the 10s stall that then
   // priced nothing. The snapshot makes it a non-event.
-  const { result, logs, warns } = await runConfigHook(providerConfig(baseURL), {
-    ...PROXY_ROUTES,
-    '/api.json': () => {
-      throw new Error('network down')
+  // The snapshot is supplied as a fixture rather than read from the shipped
+  // file: `npm run update-snapshot` runs before every release, so asserting
+  // upstream's current prices through the real snapshot would make a routine
+  // regeneration fail the suite.
+  const { result, logs, warns } = await runConfigHook(
+    providerConfig(baseURL),
+    {
+      ...PROXY_ROUTES,
+      '/api.json': () => {
+        throw new Error('network down')
+      },
     },
-  })
+    { snapshot: MODELS_DEV_TABLE },
+  )
 
   assert.deepEqual(costOf(result), {
     input: 2.5,

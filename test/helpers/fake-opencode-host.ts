@@ -207,6 +207,14 @@ export function json(body: unknown, status = 200): Response {
 }
 
 /**
+ * Every URL the fake proxy was asked for during the current `withFakeProxy`,
+ * in order. A route that throws is NOT an assertion — `refreshInBackground`
+ * swallows its own failures, so "this path must not hit the network" has to be
+ * checked here rather than left to a throw nobody observes.
+ */
+export const fetchedURLs: string[] = []
+
+/**
  * Swap `globalThis.fetch` for a router over `routes` for the duration of
  * `fn`, and always put the real one back. An unrouted path is a thrown error
  * rather than a 404, so a test that quietly hits the wrong endpoint fails
@@ -214,8 +222,10 @@ export function json(body: unknown, status = 200): Response {
  */
 export async function withFakeProxy<T>(routes: Routes, fn: () => Promise<T>): Promise<T> {
   const real = globalThis.fetch
+  fetchedURLs.length = 0
   const stub = async (input: unknown): Promise<Response> => {
     const url = new URL(String(input))
+    fetchedURLs.push(url.href)
     // The price table is fetched from models.dev, not from the proxy — see
     // load() in src/catalog.ts. Scenarios that don't care get the default
     // table; one that does can override the route.
