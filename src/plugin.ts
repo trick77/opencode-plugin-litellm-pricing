@@ -176,17 +176,16 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
       const status = getCatalogStatus()
       if (matched.length > 0 && !reportedCatalog && status.state !== 'loading') {
         reportedCatalog = true
-        if (status.state === 'ok' && (status.candidateCount ?? 0) > 0) {
+        // `ok` always carries a non-empty catalog — catalogFrom() returns null
+        // at zero candidates, so a zero-candidate `ok` cannot be constructed.
+        // `snapshot (refreshing)` and `stale cache (refreshing)` are successes
+        // too, not degraded states, and must not warn: they are what keeps
+        // startup off the network.
+        if (status.state === 'ok') {
           report(
             'info',
             `[litellm-pricing] catalog: ${status.candidateCount} model(s) from ` +
-              `${status.source} (${(status.matchedProviders ?? []).join(', ')})`,
-          )
-        } else if (status.state === 'ok') {
-          report(
-            'warn',
-            `[litellm-pricing] catalog loaded from ${status.source} but contained no ` +
-              'priceable models — every model will be injected without pricing.',
+              `${status.source} — ${(status.matchedProviders ?? []).join(', ')}`,
           )
         } else {
           report(

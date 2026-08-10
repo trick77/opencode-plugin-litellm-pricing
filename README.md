@@ -59,11 +59,25 @@ to each LiteLLM model by name: `ai-gateway-gpt-5.4` → `gpt-5.4`, longest-match
 so `…-mini` beats the base, `azure` preferred over `openai`. These are public
 list prices, not your negotiated rates.
 
-The table is fetched once from `https://models.dev/api.json` and cached for 24
-hours under `$XDG_CACHE_HOME/opencode-plugin-litellm-pricing/` (`~/.cache/…` by
-default), so normal startups touch no network at all. If the fetch fails a stale
-cache is used; if there is no cache either, models are still injected — just
-without a `cost` block — and the startup log says so.
+**Startup never waits on the network.** The plugin always answers from
+something it already has, in this order:
+
+| source | when |
+| --- | --- |
+| `cache` | a copy under `$XDG_CACHE_HOME/opencode-plugin-litellm-pricing/` (`~/.cache/…` by default) less than **7 days** old |
+| `stale cache (refreshing)` | that copy is older than 7 days — it is still served immediately, and a refresh runs in the background for next time |
+| `snapshot (refreshing)` | no cache at all (fresh install): a price table shipped inside the package, likewise with a background refresh |
+
+The startup log names which one answered. Only if the shipped snapshot were
+itself unreadable would the plugin go to the network while you wait — and it
+still injects the models in that case, just without a `cost` block, and says so.
+
+This matters because the `config` hook OpenCode calls runs exactly once, before
+anything is displayed: a fetch there is a stall you sit through. On a slow or
+captive network that used to be up to ten seconds, every time the cache expired.
+
+The cache holds only what the matcher reads — the `azure`/`openai` entries and
+the priced fields — so it is ~34 KB rather than the 3.6 MB models.dev publishes.
 
 **Why not read the table from OpenCode?** It has one, and asking for it would
 avoid the fetch. It cannot be done: OpenCode's server is unable to answer a
@@ -153,11 +167,13 @@ the plugin does nothing.
 - OpenCode with plugin support
 - Node 22+
 - A reachable LiteLLM proxy
-- Outbound access to `models.dev` on first run (cached for 24h afterwards)
+- Outbound access to `models.dev` to refresh prices. Not required to run: a
+  price table ships with the package, and refreshes happen in the background
 
 ## Releasing
 
-Tag-driven. Bump `version` in `package.json`, then push a matching tag:
+Tag-driven. Refresh the shipped price table (`npm run update-snapshot`), bump
+`version` in `package.json`, then push a matching tag:
 
 ```sh
 git tag v0.1.1

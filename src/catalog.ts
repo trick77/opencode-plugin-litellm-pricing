@@ -1,9 +1,14 @@
 // The pricing source.
 //
-// Cost is taken from the models.dev price table — fetched once and cached on
-// disk — matched to the LiteLLM model by name. See load() for why it is not
-// read from opencode's own copy: doing so deadlocks plugin startup, and its
-// list only covers providers the reader happens to have configured.
+// Cost is taken from the models.dev price table, matched to the LiteLLM model
+// by name. See load() for why it is not read from opencode's own copy: doing so
+// deadlocks plugin startup, and its list only covers providers the reader
+// happens to have configured.
+//
+// The table comes from disk — a week-long cache, falling back to a snapshot
+// shipped in the package — and never from a fetch the user is waiting on. See
+// load() for that ordering; it is the difference between instant startup and a
+// multi-second stall on a slow network.
 //
 // LiteLLM's own per-model prices are deliberately not used: they depend on the
 // deployment having base_model set correctly, which is easy to get wrong and
@@ -15,6 +20,22 @@ import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { PluginInput } from '@opencode-ai/plugin'
 import type { CostBlock, CostTier } from './types.ts'
+import { MODELS_DEV_SNAPSHOT } from './models-dev-snapshot.ts'
+
+/**
+ * The shipped snapshot, swappable for tests.
+ *
+ * With a real snapshot present the "no price table at all" path in load() is
+ * unreachable — which is the point, but it also means the code that explains
+ * that failure to the user would never be exercised. Tests blank this to reach
+ * it. Nothing else writes to it.
+ */
+let snapshotTable: unknown = MODELS_DEV_SNAPSHOT
+
+/** Replace the shipped snapshot — used by tests. */
+export function setSnapshotForTests(value: unknown): void {
+  snapshotTable = value
+}
 
 type Client = PluginInput['client']
 
@@ -67,7 +88,13 @@ interface Candidate {
   fields: CatalogFields
 }
 
-const CATALOG_TIMEOUT_MS = 10_000
+/**
+ * Bound on the models.dev fetch. Nothing on the startup path waits for it any
+ * more — it applies to the background refresh, and to the unreachable
+ * last-resort branch in load(). Short on purpose: a refresh that misses this
+ * window simply happens next launch.
+ */
+const CATALOG_TIMEOUT_MS = 3_000
 
 let catalogPromise: Promise<Catalog | null> | undefined
 let catalogStatus: CatalogStatus = { state: 'loading' }
@@ -110,6 +137,7 @@ export function catalogIfReady(): Catalog | null {
 
 /** Clear the memoized catalog — used by tests. */
 export function resetCatalogCache(): void {
+  pendingRefresh = undefined
   catalogPromise = undefined
   catalogStatus = { state: 'loading' }
   readyCatalog = null
@@ -124,8 +152,21 @@ function cachePath(): string {
   return join(base, 'opencode-plugin-litellm-pricing', 'models-dev.json')
 }
 
-/** Serve the cache without re-fetching for this long. */
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000
+/**
+ * Serve the cache without re-fetching for this long. A week: these are public
+ * list prices, which move on the scale of provider announcements, and a refresh
+ * happens in the background anyway so nobody waits for one.
+ */
+const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+/**
+ * Bump whenever the trimmed shape changes — including any change to
+ * PREFERRED_PROVIDERS or to the fields toCatalogFields reads. The cache stores
+ * a subset, so a stale layout would otherwise be served forever as if complete:
+ * a widened provider list would silently keep pricing nothing from the new
+ * provider. On a mismatch the cache is discarded and refetched.
+ */
+const CACHE_SCHEMA = 1
 
 /**
  * models.dev ships its table as an object keyed by provider id; buildFromProviders
@@ -140,19 +181,64 @@ function toProviderList(raw: unknown): unknown[] | null {
   }))
 }
 
-async function readCache(): Promise<{ providers: unknown[]; ageMs: number } | null> {
+/**
+ * The fields toCatalogFields/toCost read, and nothing else. models.dev publishes
+ * 3.6 MB; restricted to PREFERRED_PROVIDERS and these keys it is ~34 KB, which
+ * is what makes it cheap to re-read on every single start.
+ *
+ * Keep in step with scripts/update-snapshot.mjs, which trims the shipped
+ * snapshot the same way — and bump CACHE_SCHEMA when this list changes.
+ */
+const KEEP_FIELDS = ['id', 'cost', 'limit', 'reasoning', 'tool_call', 'attachment', 'modalities']
+
+/** Trim a provider list (already through toProviderList) for storage. */
+function trim(providers: unknown[]): unknown[] {
+  // Providers too, not just fields: the matcher only ever looks at
+  // PREFERRED_PROVIDERS, so storing the other 180 costs ~1.6 MB of parsing on
+  // every start to hold data nothing reads. This is the difference between a
+  // 34 KB cache and a 1.6 MB one.
+  const wanted = new Set<string>(PREFERRED_PROVIDERS)
+  return providers
+    .filter((raw) => wanted.has(String((raw as { id?: unknown }).id)))
+    .map((raw) => {
+      const p = raw as { id?: unknown; models?: unknown }
+      const models: Record<string, unknown> = {}
+      for (const [key, m] of Object.entries((p.models ?? {}) as Record<string, unknown>)) {
+        const model = (m ?? {}) as Record<string, unknown>
+        const kept: Record<string, unknown> = {}
+        for (const field of KEEP_FIELDS) if (field in model) kept[field] = model[field]
+        models[key] = kept
+      }
+      return { id: p.id, models }
+    })
+}
+
+/**
+ * Read the cached table.
+ *
+ * Note the shape difference that makes this NOT symmetric with the snapshot:
+ * the cache envelope stores an ARRAY, already through toProviderList, whereas
+ * the snapshot ships models.dev's object map and still needs converting. Mixing
+ * the two yields zero candidates and a fetch on every start — fast enough that
+ * tests still pass while the cache has silently stopped working.
+ */
+async function readCache(): Promise<{
+  providers: unknown[]
+  ageMs: number
+} | null> {
   try {
     const path = cachePath()
     const [text, info] = await Promise.all([readFile(path, 'utf8'), stat(path)])
-    const providers = toProviderList(JSON.parse(text))
-    if (!providers) return null
-    return { providers, ageMs: Date.now() - info.mtimeMs }
+    const envelope = JSON.parse(text) as { v?: unknown; providers?: unknown }
+    if (envelope?.v !== CACHE_SCHEMA || !Array.isArray(envelope.providers)) return null
+    return { providers: envelope.providers, ageMs: Date.now() - info.mtimeMs }
   } catch {
     return null
   }
 }
 
-async function writeCache(text: string): Promise<void> {
+async function writeCache(providers: unknown[]): Promise<void> {
+  const text = JSON.stringify({ v: CACHE_SCHEMA, providers: trim(providers) })
   const path = cachePath()
   // Write-then-rename, pid-scoped: two opencode processes starting at once
   // would otherwise interleave into a truncated file that never parses again
@@ -204,30 +290,90 @@ function ok(catalog: Catalog, source: string, t0: number): Catalog {
  * report $0 by accident of the reader's config, the exact failure this plugin
  * exists to prevent.
  */
+/** Fetch the live table and cache it. Throws; callers decide whether to care. */
+async function fetchTable(): Promise<unknown[]> {
+  const res = await fetch(MODELS_DEV_URL, {
+    signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const providers = toProviderList(JSON.parse(await res.text()))
+  if (!providers) throw new Error('unexpected response shape')
+  await writeCache(providers)
+  return providers
+}
+
+/** The in-flight background refresh, if any — see settleRefreshForTests. */
+let pendingRefresh: Promise<unknown> | undefined
+
+/**
+ * Refresh for the NEXT launch, without anybody waiting for it.
+ *
+ * Safe to leave running: opencode does not wait on the event loop before
+ * exiting — measured, a short CLI invocation exited 216 ms in with a
+ * deliberately black-holed 3 s fetch still pending. So this either finishes in
+ * a long-lived session and updates the cache, or the process ends first and the
+ * next launch tries again. Neither delays anything.
+ *
+ * It must swallow its own failure: nothing observes this promise, and an
+ * unhandled rejection would take the process down.
+ */
+function refreshInBackground(): void {
+  pendingRefresh = fetchTable().catch(() => {})
+}
+
+/**
+ * Await whatever background refresh the last load started — used by tests.
+ *
+ * The refresh resolves `cachePath()` when it *writes*, not when it starts, and
+ * the suite swaps `XDG_CACHE_HOME` per scenario. A refresh still in flight when
+ * the next scenario begins therefore writes a valid cache into the NEXT test's
+ * directory, which silently turns a snapshot-branch assertion into a cache hit.
+ * Settling it at the end of each scenario is what keeps the branches isolated.
+ */
+export async function settleRefreshForTests(): Promise<void> {
+  await pendingRefresh
+}
+
 async function load(_client: Client): Promise<Catalog | null> {
   const t0 = Date.now()
 
-  // A fresh cache is authoritative: it keeps startup off the network entirely.
+  // Order matters, and the rule is: NEVER await the network to answer this.
+  // The `config` hook runs once, so this call sits directly in front of
+  // startup; a fetch here is a stall the user watches. Every branch below
+  // answers from something already on disk or in the package, and demotes the
+  // fetch to a background top-up for next time.
   const cached = await readCache()
-  if (cached && cached.ageMs < CACHE_TTL_MS) {
-    const catalog = catalogFrom(cached.providers)
-    if (catalog) return ok(catalog, 'cache', t0)
+
+  const fromCache = cached ? catalogFrom(cached.providers) : null
+
+  // 1. A fresh cache is authoritative — no network at all.
+  if (cached && fromCache && cached.ageMs < CACHE_TTL_MS) return ok(fromCache, 'cache', t0)
+
+  // 2. A stale cache is still the right answer NOW. Week-old list prices beat
+  //    making someone wait, so serve them and refresh behind their back.
+  if (fromCache) {
+    refreshInBackground()
+    return ok(fromCache, 'stale cache (refreshing)', t0)
   }
 
+  // 3. No usable cache — a fresh install, or one that was cleared. The shipped
+  //    snapshot covers it, so even this case costs nothing.
+  const snapshot = toProviderList(snapshotTable)
+  const fromSnapshot = snapshot && catalogFrom(snapshot)
+  if (fromSnapshot) {
+    refreshInBackground()
+    return ok(fromSnapshot, 'snapshot (refreshing)', t0)
+  }
+
+  // 4. Only if the shipped snapshot is itself unusable, which should not be
+  //    reachable — it is generated and asserted non-empty at build time. Kept
+  //    so a corrupted package degrades to a bounded wait instead of no prices.
   try {
-    const res = await fetch(MODELS_DEV_URL, { signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS) })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const text = await res.text()
-    const providers = toProviderList(JSON.parse(text))
-    if (!providers) throw new Error('unexpected response shape')
+    const providers = await fetchTable()
     const catalog = catalogFrom(providers)
     if (!catalog) throw new Error('no priceable providers')
-    await writeCache(text)
     return ok(catalog, MODELS_DEV_URL, t0)
   } catch (err) {
-    // A stale table still prices far better than showing $0.
-    const stale = cached && catalogFrom(cached.providers)
-    if (stale) return ok(stale, 'stale cache', t0)
     catalogStatus = {
       state: 'unavailable',
       source: MODELS_DEV_URL,

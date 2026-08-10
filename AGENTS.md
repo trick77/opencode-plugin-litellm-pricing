@@ -48,10 +48,26 @@ then `cd test/probe && opencode models`.
   `{ input, output, cache_read, cache_write, context_over_200k }`,
   `additionalProperties:false`. NEVER emit a nested `cache` object — the schema
   rejects it and the whole `cost` is dropped. Values are USD per 1M tokens.
-- ONE cost source: `https://models.dev/api.json`, fetched directly, cached 24h
-  under `$XDG_CACHE_HOME/opencode-plugin-litellm-pricing/`. Costs ALREADY
-  per-1M — copy through, do NOT ×1e6. Never source cost from the proxy
-  (base_model misconfig silently bills $0).
+- ONE cost source: the models.dev price table. Costs ALREADY per-1M — copy
+  through, do NOT ×1e6. Never source cost from the proxy (base_model misconfig
+  silently bills $0).
+- NEVER await a fetch on the startup path. The `config` hook runs once, before
+  anything renders, so a fetch there is a stall the user sits through. `load()`
+  answers from cache (7d) → stale cache → shipped snapshot, each demoting the
+  fetch to a background refresh. Background refresh must `.catch()` — nothing
+  observes it, and an unhandled rejection kills the process. Safe to leave
+  pending: opencode exits without draining the event loop (measured: CLI exited
+  216ms in with a black-holed 3s fetch outstanding), so it lands in long
+  sessions and is simply skipped in short ones.
+- `src/models-dev-snapshot.ts` is GENERATED — `npm run update-snapshot`, never
+  hand-edit. Keep `PREFERRED_PROVIDERS` and the kept-field list in
+  `scripts/update-snapshot.mjs` in step with `catalog.ts` — the script CANNOT
+  import them, `catalog.ts` imports the snapshot it generates. Bump
+  `CACHE_SCHEMA` when the trimmed shape changes or old caches are served as if
+  complete.
+- NEVER pin an upstream price against the real snapshot in a test — it is
+  regenerated before every release, so `npm run update-snapshot` would fail the
+  suite at tag time. Pass a fixture via the harness `snapshot` option instead.
 - NEVER go back to `client.config.providers()` for cost: deadlocks (above), and
   lists only the reader's configured providers — no Azure creds → no `azure`,
   and its `openai` entry reports every cost as 0 → real models priced $0.
@@ -104,6 +120,8 @@ then `cd test/probe && opencode models`.
 
 ## Release
 
+- Run `npm run update-snapshot` BEFORE tagging, else the release ships a price
+  table older than itself.
 - Tag-driven. Bump `version` in `package.json`, push `vX.Y.Z` (must match). CI
   publishes to npm via OIDC trusted publishing. Do not `npm publish` by hand.
 - Tag on `master` AFTER merge — the workflow publishes whatever commit the tag
