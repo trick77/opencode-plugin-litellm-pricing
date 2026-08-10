@@ -47,13 +47,15 @@ export interface Catalog {
  * that prices nothing is indistinguishable from a run with nothing to price.
  */
 export interface CatalogStatus {
-  state: 'ok' | 'unavailable'
+  /** 'loading' until the load settles — never a verdict, just "not yet". */
+  state: 'loading' | 'ok' | 'unavailable'
   /** Which endpoint answered. */
   source?: string
   /** Populated when state is 'unavailable'. */
   reason?: string
   candidateCount?: number
   matchedProviders?: readonly string[]
+  elapsedMs?: number
 }
 
 interface Candidate {
@@ -61,10 +63,11 @@ interface Candidate {
   fields: CatalogFields
 }
 
-const CATALOG_TIMEOUT_MS = 2000
+const CATALOG_TIMEOUT_MS = 30_000
 
 let catalogPromise: Promise<Catalog | null> | undefined
-let catalogStatus: CatalogStatus = { state: 'unavailable', reason: 'not loaded yet' }
+let catalogStatus: CatalogStatus = { state: 'loading' }
+let readyCatalog: Catalog | null = null
 
 /** What happened on the (single) catalog load. Safe to call before it runs. */
 export function getCatalogStatus(): CatalogStatus {
@@ -73,18 +76,28 @@ export function getCatalogStatus(): CatalogStatus {
 
 /** Load opencode's model catalog once per process (memoized). */
 export function getCatalog(client: Client): Promise<Catalog | null> {
-  if (!catalogPromise) catalogPromise = load(client)
+  if (!catalogPromise) {
+    catalogPromise = load(client)
+    // A promise cannot be inspected synchronously, so latch the result for
+    // catalogIfReady().
+    void catalogPromise.then((c) => {
+      readyCatalog = c
+    })
+  }
   return catalogPromise
 }
 
 /**
- * Reject after CATALOG_TIMEOUT_MS so a hung client call can't block startup.
+ * Reject after CATALOG_TIMEOUT_MS so a hung client call can't leak forever.
  *
- * `client.config.providers()` is served by the same process that is building
- * the config, so calling it from inside the `config` hook is re-entrant: it
- * cannot answer until the hook waiting on it returns. `preloadCatalog` avoids
- * that by warming the cache before the hook runs; this bound means any future
- * re-entrancy costs a second and degrades to "no pricing" instead of stalling.
+ * This is a leak guard, not a startup guard: nothing awaits the load any more.
+ * `client.config.providers()` is served by the same process that is loading
+ * plugins and building the config, so it cannot answer while a plugin is
+ * blocked waiting on it — measured against a live server, an awaited call
+ * timed out at 2002 ms while the same call, left unawaited, resolved at
+ * 2154 ms, immediately after the `config` hook returned. Awaiting it during
+ * startup is a deadlock at any timeout value, which is why startCatalogLoad
+ * fires it and walks away.
  */
 function withTimeout<T>(p: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -98,45 +111,129 @@ function withTimeout<T>(p: Promise<T>): Promise<T> {
   }) as Promise<T>
 }
 
-/** Warm the catalog cache before the config hook runs. Never throws. */
-export async function preloadCatalog(client: Client): Promise<void> {
-  await getCatalog(client)
+/**
+ * Kick the catalog load off without waiting for it. Never throws.
+ *
+ * Deliberately not awaited — see withTimeout above. The `config` hook runs
+ * several times per run, so a load started here lands in time for a later
+ * invocation to price what the first one could only inject bare.
+ */
+export function startCatalogLoad(client: Client): void {
+  void getCatalog(client)
+}
+
+/**
+ * The catalog if it has already finished loading, else null.
+ *
+ * Callers on the startup path must use this rather than awaiting getCatalog:
+ * awaiting is what deadlocks.
+ */
+export function catalogIfReady(): Catalog | null {
+  return readyCatalog
 }
 
 /** Clear the memoized catalog — used by tests. */
 export function resetCatalogCache(): void {
   catalogPromise = undefined
-  catalogStatus = { state: 'unavailable', reason: 'not loaded yet' }
+  catalogStatus = { state: 'loading' }
+  readyCatalog = null
 }
 
+/**
+ * Where the price table comes from, best first.
+ *
+ * `provider.list` (/provider) returns `all`: every models.dev provider,
+ * independent of what the user has configured or authenticated. That is what a
+ * price table needs. `config.providers` returns only configured/detected
+ * providers — on a machine with no Azure credentials it omits `azure`
+ * entirely, and the `openai` entry it does return is the user's own, which
+ * reports every cost as 0. Sourcing prices from it means a model priced $0 by
+ * accident of the reader's config, which is the exact failure this plugin
+ * exists to prevent. It stays only as a fallback for hosts without /provider.
+ *
+ * It has a second, load-bearing role. Nothing here can be awaited during
+ * plugin load: the server that answers these calls cannot answer anything
+ * while a plugin blocks on it, so awaiting either endpoint deadlocks until the
+ * timeout — measured at 60 s for both. The catalog therefore lands after the
+ * first `config` pass has already injected models bare, and only a LATER pass
+ * can price them. Requesting config.providers is what prompts opencode to
+ * rebuild the config and run that later pass; with provider.list alone the
+ * hook is invoked exactly once and the prices never get in.
+ *
+ * Both endpoints return the same nested model shape at runtime
+ * (`capabilities.toolcall`, `cost.cache.read`, `experimentalOver200K`), so
+ * `toCatalogFields` parses either. Note the SDK's generated type for /provider
+ * describes a flatter shape than the server actually sends; the shape below is
+ * what a live 1.18 server returns.
+ */
+const SOURCES: Array<{ name: string; fetch: (client: Client) => Promise<unknown> }> = [
+  {
+    name: 'provider.list',
+    fetch: async (client) => {
+      const r = (await client.provider.list({})) as unknown as {
+        data?: { all?: unknown }
+        all?: unknown
+      }
+      return r?.data?.all ?? r?.all
+    },
+  },
+  {
+    name: 'config.providers',
+    fetch: async (client) => {
+      const r = (await client.config.providers({})) as unknown as {
+        data?: { providers?: unknown }
+        providers?: unknown
+      }
+      return r?.data?.providers ?? r?.providers
+    },
+  },
+]
+
 async function load(client: Client): Promise<Catalog | null> {
-  const source = 'config.providers'
-  try {
-    const result = (await withTimeout(client.config.providers({}))) as unknown as {
-      data?: { providers?: unknown }
-      providers?: unknown
-    }
-    const providers = result?.data?.providers ?? result?.providers
-    if (!Array.isArray(providers)) {
-      catalogStatus = { state: 'unavailable', source, reason: 'response had no provider list' }
-      return null
-    }
-    const catalog = buildFromProviders(providers)
+  const t0 = Date.now()
+  // Fired together, not in sequence. Sequencing would make the fallback wait
+  // out the primary's timeout, and the window in which a later `config` pass
+  // can still use the result is short — see startCatalogLoad.
+  const attempts = await Promise.all(
+    SOURCES.map(async (source) => {
+      try {
+        const providers = await withTimeout(source.fetch(client))
+        if (!Array.isArray(providers))
+          return { source, reason: 'no provider list in response', catalog: null }
+        const catalog = buildFromProviders(providers)
+        // Providers we can't price are no better than no providers.
+        if (catalog.candidateCount === 0)
+          return { source, reason: 'no priceable providers', catalog: null }
+        return { source, reason: '', catalog }
+      } catch (err) {
+        return {
+          source,
+          reason: err instanceof Error ? err.message : String(err),
+          catalog: null,
+        }
+      }
+    }),
+  )
+
+  // SOURCES order is preference order, so the first success wins.
+  const won = attempts.find((a) => a.catalog)
+  if (won?.catalog) {
     catalogStatus = {
       state: 'ok',
-      source,
-      candidateCount: catalog.candidateCount,
-      matchedProviders: catalog.matchedProviders,
+      source: won.source.name,
+      elapsedMs: Date.now() - t0,
+      candidateCount: won.catalog.candidateCount,
+      matchedProviders: won.catalog.matchedProviders,
     }
-    return catalog
-  } catch (err) {
-    catalogStatus = {
-      state: 'unavailable',
-      source,
-      reason: err instanceof Error ? err.message : String(err),
-    }
-    return null
+    return won.catalog
   }
+  catalogStatus = {
+    state: 'unavailable',
+    reason:
+      `${attempts.map((a) => `${a.source.name}: ${a.reason}`).join('; ')} ` +
+      `(after ${Date.now() - t0}ms)`,
+  }
+  return null
 }
 
 /**

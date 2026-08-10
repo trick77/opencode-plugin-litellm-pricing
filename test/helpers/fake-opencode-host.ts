@@ -76,7 +76,8 @@ export interface LoggedEntry {
 }
 
 /**
- * The members this plugin touches are `client.config.providers({})` — see
+ * The members this plugin touches are `client.provider.list({})` and
+ * `client.config.providers({})` — see
  * `load()` in src/catalog.ts — and `client.app.log({...})`, the only path into
  * opencode's own log file. Everything else on PluginInput is left off and the
  * whole thing cast, so a test fails loudly if the plugin ever starts reaching
@@ -88,10 +89,21 @@ export interface LoggedEntry {
  */
 export function fakePluginInput(
   providers: unknown[],
-  opts: { logged?: LoggedEntry[]; logFails?: boolean } = {},
+  opts: {
+    logged?: LoggedEntry[]
+    logFails?: boolean
+    /** What /provider serves. Omit to serve the same list as config.providers. */
+    all?: unknown[]
+    /** Drop /provider entirely, as an older opencode would. */
+    noProviderList?: boolean
+  } = {},
 ): PluginInput {
+  const provider = opts.noProviderList
+    ? undefined
+    : { list: async () => ({ data: { all: opts.all ?? providers } }) }
   return {
     client: {
+      provider,
       config: {
         providers: async () => ({ data: { providers } }),
       },

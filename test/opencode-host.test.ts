@@ -37,8 +37,12 @@ async function runConfigHook(
   routes: Routes,
   opts: {
     catalogProviders?: unknown[]
+    catalogAll?: unknown[]
+    noProviderList?: boolean
     logged?: LoggedEntry[]
     logFails?: boolean
+    /** Run the hook once, before the catalog can land. */
+    singlePass?: boolean
   } = {},
 ) {
   resetCatalogCache()
@@ -49,9 +53,20 @@ async function runConfigHook(
       const input = fakePluginInput(opts.catalogProviders ?? CATALOG_PROVIDERS, {
         logged: opts.logged,
         logFails: opts.logFails,
+        all: opts.catalogAll,
+        noProviderList: opts.noProviderList,
       })
       const hooks = await plugin(input)
+      // Two passes, because that is what opencode does — and it is load-bearing
+      // here: the catalog cannot resolve while the first pass is running (see
+      // startCatalogLoad), so pass one injects bare and pass two prices. A
+      // single-pass harness would assert against a state production never
+      // settles in.
       await hooks.config?.(config as unknown as Config)
+      if (!opts.singlePass) {
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        await hooks.config?.(config as unknown as Config)
+      }
       return config
     }),
   )
@@ -132,8 +147,9 @@ test('injects discovered models with catalog pricing into the config', async () 
   assert.equal(entry.tool_call, true)
 
   assert.ok(
-    logs.some((l) => l.includes('1 discovered, 1 added, pricing for 1/1')),
-    `expected a summary line, got: ${logs.join(' | ')}`,
+    logs.some((l) => l.includes('1 discovered, 1 added')) &&
+      logs.some((l) => l.includes('catalog arrived late, priced 1/1')),
+    `expected a summary and a late-pricing line, got: ${logs.join(' | ')}`,
   )
 })
 
@@ -294,21 +310,60 @@ test('the summary accounts for every discovered model, and names the unpriced', 
   })
   const all = [...logs, ...warns]
 
-  // 4 discovered = 2 added + 1 non-chat + 1 wildcard. Coverage is stated over
-  // what was added, not over everything discovered: the embedding and the
-  // wildcard never reach the picker, so they cannot bill anything.
+  // 4 discovered = 2 added + 1 non-chat + 1 wildcard, and of the 2 added only
+  // ai-gateway-gpt-5.4 has a catalog match.
   assert.ok(
-    all.some((l) => l.includes('4 discovered, 2 added, pricing for 1/2')),
+    all.some((l) => l.includes('4 discovered, 2 added')),
     `expected an accounted summary, got: ${all.join(' | ')}`,
+  )
+  assert.ok(
+    all.some((l) => l.includes('catalog arrived late, priced 1/2')),
+    `expected the late-pricing count, got: ${all.join(' | ')}`,
   )
   assert.ok(
     all.some((l) => l.includes('1 non-chat hidden') && l.includes('1 wildcard ignored')),
     `expected the non-chat and wildcard clauses, got: ${all.join(' | ')}`,
   )
-  // The count alone doesn't say WHICH model reads as free.
+})
+
+test('the first pass injects bare rather than blocking on the catalog', async () => {
+  const baseURL = 'https://proxy-firstpass.test'
+  // The catalog call cannot be answered while this pass is running, so the
+  // models must land unpriced rather than the pass stalling or dropping them.
+  const { result, logs } = await runConfigHook(
+    providerConfig(baseURL),
+    {
+      '/v1/models': () => json({ data: MIXED_MODELS }),
+      '/model_group/info': () => json({ data: [] }),
+    },
+    { singlePass: true },
+  )
+
+  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
+    PROVIDER_KEY
+  ]!.models
+  assert.ok(models['ai-gateway-gpt-5.4'], 'the model must be in the picker even unpriced')
+  assert.equal((models['ai-gateway-gpt-5.4'] as Record<string, unknown>).cost, undefined)
+  // "pending" and "missing" must not read the same: warning here would cry
+  // wolf on every normal startup.
   assert.ok(
-    all.some((l) => l.includes('no pricing: some-unknown-llama-thing')),
-    `expected the unpriced model named, got: ${all.join(' | ')}`,
+    logs.some((l) => l.includes('pricing pending')),
+    `expected a pending summary, got: ${logs.join(' | ')}`,
+  )
+})
+
+test('models unpriced by a loaded catalog are named', async () => {
+  const baseURL = 'https://proxy-unpriced.test'
+  // Third pass: by now the catalog is loaded, so discovery re-runs against it
+  // and the count alone doesn't say WHICH model reads as free.
+  const { warns, logs } = await runConfigHook(providerConfig(baseURL), {
+    '/v1/models': () => json({ data: MIXED_MODELS }),
+    '/model_group/info': () => json({ data: [] }),
+  })
+  const all = [...logs, ...warns]
+  assert.ok(
+    all.some((l) => l.includes('catalog arrived late, priced 1/2')),
+    `expected 1 of 2 priced late, got: ${all.join(' | ')}`,
   )
 })
 
@@ -368,14 +423,16 @@ test('an unavailable catalog is reported, not swallowed into silent $0', async (
   const all = [...logs, ...warns]
 
   assert.ok(
-    warns.some((l) => l.includes('no priceable models')),
+    warns.some((l) => l.includes('no priceable providers')),
     `expected a catalog warning, got: ${all.join(' | ')}`,
   )
   // And the summary must warn too: added > 0 with priced === 0 is the
   // systematic-failure shape, not an informational result.
+  // And nothing is repriced later, because there is no catalog to reprice
+  // from — the warning above is the only explanation the user will get.
   assert.ok(
-    warns.some((l) => l.includes('pricing for 0/2')),
-    `expected the zero-coverage summary to warn, got: ${all.join(' | ')}`,
+    !all.some((l) => l.includes('catalog arrived late')),
+    `expected no late pricing without a catalog, got: ${all.join(' | ')}`,
   )
 })
 
@@ -389,7 +446,66 @@ test('a working catalog reports its size and source', async () => {
   // This line is what separates "the catalog never loaded" from "the catalog
   // loaded and nothing matched" — the two causes of a clean zero.
   assert.ok(
-    logs.some((l) => l.includes('catalog:') && l.includes('config.providers')),
+    logs.some((l) => l.includes('catalog:') && l.includes('provider.list')),
     `expected a catalog line, got: ${logs.join(' | ')}`,
+  )
+})
+
+test('prices from /provider, not from the reader own configured providers', async () => {
+  const baseURL = 'https://proxy-source.test'
+  // What config.providers returns on a machine with no Azure credentials: the
+  // user's own `openai`, which reports every cost as 0. Sourcing prices from
+  // it would price a real model at $0 by accident of the reader's config.
+  const CONFIGURED = [
+    {
+      id: 'openai',
+      models: {
+        'gpt-5.4': {
+          id: 'gpt-5.4',
+          cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+          limit: { context: 1, output: 1 },
+          capabilities: { input: {} },
+        },
+      },
+    },
+  ]
+  const { result } = await runConfigHook(
+    providerConfig(baseURL),
+    {
+      '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
+      '/model_group/info': () => json({ data: [] }),
+    },
+    { catalogProviders: CONFIGURED, catalogAll: CATALOG_PROVIDERS },
+  )
+
+  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
+    PROVIDER_KEY
+  ]!.models
+  const entry = models['ai-gateway-gpt-5.4'] as Record<string, unknown>
+  assert.deepEqual(entry.cost, { input: 2.5, output: 15, cache_read: 0.25 })
+  // Context size and the other model parameters ride along on the same match.
+  assert.deepEqual(entry.limit, { context: 1050000, output: 128000 })
+  assert.equal(entry.tool_call, true)
+  assert.equal(entry.reasoning, true)
+})
+
+test('falls back to config.providers when /provider is missing', async () => {
+  const baseURL = 'https://proxy-fallback.test'
+  const { result, logs } = await runConfigHook(
+    providerConfig(baseURL),
+    {
+      '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
+      '/model_group/info': () => json({ data: [] }),
+    },
+    { noProviderList: true },
+  )
+
+  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
+    PROVIDER_KEY
+  ]!.models
+  assert.ok((models['ai-gateway-gpt-5.4'] as Record<string, unknown>).cost, 'still priced')
+  assert.ok(
+    logs.some((l) => l.includes('config.providers')),
+    `expected the fallback source named, got: ${logs.join(' | ')}`,
   )
 })
