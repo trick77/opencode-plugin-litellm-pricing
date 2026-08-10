@@ -34,6 +34,26 @@ export interface CatalogFields {
 export interface Catalog {
   /** Resolve a LiteLLM model name to catalog fields, or null if unmatched. */
   resolve(litellmModelName: string): CatalogFields | null
+  /** How many priceable models the catalog was built from. */
+  readonly candidateCount: number
+  /** Which of PREFERRED_PROVIDERS actually contributed candidates. */
+  readonly matchedProviders: readonly string[]
+}
+
+/**
+ * Why pricing did or did not happen. `getCatalog` returns `null` for both "the
+ * load failed" and "the response had nothing usable", and `resolve` returns
+ * `null` for both "no catalog" and "no name match" — so without this, a run
+ * that prices nothing is indistinguishable from a run with nothing to price.
+ */
+export interface CatalogStatus {
+  state: 'ok' | 'unavailable'
+  /** Which endpoint answered. */
+  source?: string
+  /** Populated when state is 'unavailable'. */
+  reason?: string
+  candidateCount?: number
+  matchedProviders?: readonly string[]
 }
 
 interface Candidate {
@@ -44,6 +64,12 @@ interface Candidate {
 const CATALOG_TIMEOUT_MS = 2000
 
 let catalogPromise: Promise<Catalog | null> | undefined
+let catalogStatus: CatalogStatus = { state: 'unavailable', reason: 'not loaded yet' }
+
+/** What happened on the (single) catalog load. Safe to call before it runs. */
+export function getCatalogStatus(): CatalogStatus {
+  return catalogStatus
+}
 
 /** Load opencode's model catalog once per process (memoized). */
 export function getCatalog(client: Client): Promise<Catalog | null> {
@@ -80,18 +106,35 @@ export async function preloadCatalog(client: Client): Promise<void> {
 /** Clear the memoized catalog — used by tests. */
 export function resetCatalogCache(): void {
   catalogPromise = undefined
+  catalogStatus = { state: 'unavailable', reason: 'not loaded yet' }
 }
 
 async function load(client: Client): Promise<Catalog | null> {
+  const source = 'config.providers'
   try {
     const result = (await withTimeout(client.config.providers({}))) as unknown as {
       data?: { providers?: unknown }
       providers?: unknown
     }
     const providers = result?.data?.providers ?? result?.providers
-    if (!Array.isArray(providers)) return null
-    return buildFromProviders(providers)
-  } catch {
+    if (!Array.isArray(providers)) {
+      catalogStatus = { state: 'unavailable', source, reason: 'response had no provider list' }
+      return null
+    }
+    const catalog = buildFromProviders(providers)
+    catalogStatus = {
+      state: 'ok',
+      source,
+      candidateCount: catalog.candidateCount,
+      matchedProviders: catalog.matchedProviders,
+    }
+    return catalog
+  } catch (err) {
+    catalogStatus = {
+      state: 'unavailable',
+      source,
+      reason: err instanceof Error ? err.message : String(err),
+    }
     return null
   }
 }
@@ -112,9 +155,11 @@ export function buildFromProviders(providers: unknown[]): Catalog {
   // the first substring match is the most specific (…-mini beats base) and,
   // on a length tie, comes from the preferred provider (stable sort).
   const candidates: Candidate[] = []
+  const matched: string[] = []
   for (const provider of PREFERRED_PROVIDERS) {
     const models = byId.get(provider)?.models
     if (!models || typeof models !== 'object') continue
+    matched.push(provider)
     for (const [key, raw] of Object.entries(models as Record<string, unknown>)) {
       const m = (raw ?? {}) as Record<string, unknown>
       const id = typeof m.id === 'string' ? m.id : key
@@ -124,6 +169,8 @@ export function buildFromProviders(providers: unknown[]): Catalog {
   candidates.sort((a, b) => b.id.length - a.id.length)
 
   return {
+    candidateCount: candidates.length,
+    matchedProviders: matched,
     resolve(litellmModelName: string): CatalogFields | null {
       const norm = litellmModelName.toLowerCase()
       for (const c of candidates) {

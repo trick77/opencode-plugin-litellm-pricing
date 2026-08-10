@@ -94,6 +94,32 @@ positive hides a model you can actually use: `amazon.nova-pro-v1` and
 `gpt-4o-audio-preview` stay in the picker. The cost of that caution is that an
 oddly-named non-chat model can slip through when the name is all we have.
 
+## The startup log
+
+Every message goes both to the opencode server's stdout and to opencode's own
+log file, `~/.local/share/opencode/log/opencode.log` — so it can still be read
+afterwards, or from a session that isn't attached to that stdout:
+
+```
+grep litellm-pricing ~/.local/share/opencode/log/opencode.log
+```
+
+A healthy run looks like this:
+
+```
+[litellm-pricing] catalog: 412 model(s) from config.providers (azure, openai)
+[litellm-pricing] provider "litellm": 41 discovered, 34 added, pricing for 31/34
+  (5 non-chat hidden, 2 wildcard ignored) from https://litellm.example.com
+[litellm-pricing]   no pricing: my-finetune-v2, internal-router, … +1 more
+```
+
+Coverage is stated over the models actually **added**, not over everything
+discovered: non-chat and wildcard entries never reach the picker, so they can't
+bill anything. The unpriced models are named because a count alone doesn't say
+which one will read as free. `pricing for 0/N` is logged as a **warning**, not
+as info — that shape means something is systematically wrong, usually the
+catalog line above reporting that it was unavailable or empty.
+
 ## Provider matching
 
 The plugin enriches any provider whose id is `opencode-plugin-litellm-pricing`

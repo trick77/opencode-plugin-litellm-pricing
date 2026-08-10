@@ -68,17 +68,39 @@ export function loadPlugins(mod: object): Plugin[] {
 
 // --- the plugin input -----------------------------------------------------
 
+/** Every `client.app.log` body the plugin wrote, in order. */
+export interface LoggedEntry {
+  service: string
+  level: string
+  message: string
+}
+
 /**
- * The only member this plugin touches is `client.config.providers({})` — see
- * `load()` in src/catalog.ts. Everything else on PluginInput is left off and
- * the whole thing cast, so a test fails loudly if the plugin ever starts
- * reaching for something new rather than silently reading `undefined`.
+ * The members this plugin touches are `client.config.providers({})` — see
+ * `load()` in src/catalog.ts — and `client.app.log({...})`, the only path into
+ * opencode's own log file. Everything else on PluginInput is left off and the
+ * whole thing cast, so a test fails loudly if the plugin ever starts reaching
+ * for something new rather than silently reading `undefined`.
+ *
+ * Note this stub cannot verify the *shape* of the app.log call: it is
+ * hand-written, so it matches whatever the plugin does. `tsc --noEmit` against
+ * the real SDK types is what guards that.
  */
-export function fakePluginInput(providers: unknown[]): PluginInput {
+export function fakePluginInput(
+  providers: unknown[],
+  opts: { logged?: LoggedEntry[]; logFails?: boolean } = {},
+): PluginInput {
   return {
     client: {
       config: {
         providers: async () => ({ data: { providers } }),
+      },
+      app: {
+        log: async (options: { body: LoggedEntry }) => {
+          if (opts.logFails) throw new Error('log endpoint unavailable')
+          opts.logged?.push(options.body)
+          return {}
+        },
       },
     },
   } as unknown as PluginInput

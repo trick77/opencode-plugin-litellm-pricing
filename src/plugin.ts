@@ -39,7 +39,7 @@ import {
   resolveApiKey,
 } from './litellm-api.ts'
 import { configModelFromCatalog, enrichModel, groupInfoToModelInfo } from './build-config-model.ts'
-import { getCatalog, preloadCatalog } from './catalog.ts'
+import { getCatalog, getCatalogStatus, preloadCatalog } from './catalog.ts'
 
 // Default provider id — kept identical to the npm package name so the
 // `plugin` and `provider` keys in opencode.json read the same.
@@ -69,6 +69,17 @@ interface MutableConfig {
  * baseURL so repeat invocations return early instead of re-querying.
  */
 const injectedModelIds = new Map<string, Set<string>>()
+
+/** How many unpriced model ids to name inline before summarising the rest. */
+const UNPRICED_LIST_LIMIT = 15
+
+/** The catalog is loaded once per process, so report on it once too. */
+let reportedCatalog = false
+
+/** Clear the once-per-process report guard — used by tests. */
+export function resetReportedCatalog(): void {
+  reportedCatalog = false
+}
 
 /**
  * Does a provider id / options block designate a LiteLLM-backed provider?
@@ -106,6 +117,21 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
   // lose every price, since the swallowed failure left every model unmatched.
   await preloadCatalog(input.client)
 
+  // Every message goes to both sinks. console reaches whoever is attached to
+  // the opencode server's stdout; client.app.log is the only path into
+  // ~/.local/share/opencode/log/opencode.log, which is where anyone asking
+  // "why does this model show $0?" after the fact will actually look.
+  //
+  // Fire-and-forget on purpose: client calls made from inside the `config`
+  // hook are re-entrant (see the comment on withTimeout in catalog.ts), so
+  // awaiting one here risks stalling startup. A failed log must never be
+  // able to break config loading either.
+  const report = (level: 'info' | 'warn', message: string) => {
+    if (level === 'warn') console.warn(message)
+    else console.log(message)
+    void input.client.app.log({ body: { service: 'litellm-pricing', level, message } }).catch(() => {})
+  }
+
   return {
     config: async (rawConfig: Config) => {
       const config = rawConfig as unknown as MutableConfig
@@ -130,6 +156,32 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
         }
       }
 
+      // Only once there is a LiteLLM provider to enrich: with none configured
+      // the plugin does nothing, and a "no pricing" warning would be noise.
+      if (matched.length > 0 && !reportedCatalog) {
+        reportedCatalog = true
+        const status = getCatalogStatus()
+        if (status.state === 'ok' && (status.candidateCount ?? 0) > 0) {
+          report(
+            'info',
+            `[litellm-pricing] catalog: ${status.candidateCount} model(s) from ` +
+              `${status.source} (${(status.matchedProviders ?? []).join(', ')})`,
+          )
+        } else if (status.state === 'ok') {
+          report(
+            'warn',
+            `[litellm-pricing] catalog loaded from ${status.source} but contained no ` +
+              'priceable models — every model will be injected without pricing.',
+          )
+        } else {
+          report(
+            'warn',
+            '[litellm-pricing] models.dev catalog unavailable ' +
+              `(${status.reason}) — every model will be injected without pricing.`,
+          )
+        }
+      }
+
       for (const { id: providerId, provider } of matched) {
         const options = (provider.options ?? {}) as Record<string, unknown>
         const configuredBase = typeof options.baseURL === 'string' ? options.baseURL : undefined
@@ -141,7 +193,8 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
         // The configured URL is the only URL. Nothing is guessed, nothing is
         // probed locally.
         if (!configuredBase) {
-          console.warn(
+          report(
+            'warn',
             `[litellm-pricing] provider "${providerId}" has no options.baseURL — set it to your LiteLLM URL; nothing was injected.`,
           )
           continue
@@ -175,15 +228,17 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           try {
             discovered = await discoverLiteLLMModels(baseURL, apiKey, customHeaders)
           } catch (err) {
-            console.warn(
-              `[litellm-pricing] Model discovery failed for provider "${providerId}" at ${baseURL}:`,
-              err instanceof Error ? err.message : String(err),
+            report(
+              'warn',
+              `[litellm-pricing] Model discovery failed for provider "${providerId}" at ${baseURL}: ` +
+                (err instanceof Error ? err.message : String(err)),
             )
             return
           }
 
           if (discovered.length === 0) {
-            console.warn(
+            report(
+              'warn',
               `[litellm-pricing] LiteLLM responded for provider "${providerId}" but exposed zero models.`,
             )
             return
@@ -202,21 +257,39 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
             groups = null
           }
 
+          // Every discovered entry lands in exactly one of these, so the
+          // summary can be read as a complete account of what LiteLLM offered:
+          // added + priced-subset, and the four reasons a model didn't make it.
           let added = 0
           let priced = 0
           let skipped = 0
           let wildcards = 0
+          let preexisting = 0
+          let reinjected = 0
+          let malformed = 0
+          const unpricedIds: string[] = []
+          const ours = injectedModelIds.get(baseURL)
           for (const model of discovered) {
             // Skip malformed entries rather than throwing out of the hook.
-            if (!model || typeof model.id !== 'string') continue
+            if (!model || typeof model.id !== 'string') {
+              malformed++
+              continue
+            }
             // Wildcard entries (`deepseek/*`) are access rules, not callable
             // models — invoking one sends a literal `*` upstream.
             if (model.id.includes('*')) {
               wildcards++
               continue
             }
-            // Never overwrite user-curated entries.
-            if (models[model.id]) continue
+            // Never overwrite user-curated entries. An id we injected on an
+            // earlier `config` invocation is not one of those — counting it as
+            // the user's config would turn a re-entry into a summary claiming
+            // the user hand-wrote everything we just added.
+            if (models[model.id]) {
+              if (ours?.has(model.id)) reinjected++
+              else preexisting++
+              continue
+            }
 
             // /model_group/info is keyed by model_group, which is exactly
             // the id /v1/models reports — no alias resolution needed.
@@ -236,15 +309,24 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
             models[model.id] = entry
             added++
             if (entry.cost) priced++
+            else unpricedIds.push(model.id)
           }
 
           injectedModelIds.set(baseURL, new Set(Object.keys(models)))
 
-          console.log(
-            `[litellm-pricing] provider "${providerId}": ${added} model(s) added` +
-              ` (${priced} with pricing` +
-              (skipped > 0 ? `, ${skipped} non-chat hidden` : '') +
+          // Pricing coverage is stated over the models actually injected, not
+          // over everything discovered: non-chat and wildcard entries never
+          // reach the picker, so they can't bill anything and aren't a pricing
+          // problem. `added > 0 && priced === 0` is the systematic-failure
+          // shape, so it warns rather than informs.
+          report(
+            added > 0 && priced === 0 ? 'warn' : 'info',
+            `[litellm-pricing] provider "${providerId}": ${discovered.length} discovered, ` +
+              `${added} added, pricing for ${priced}/${added}` +
+              ` (${skipped} non-chat hidden` +
               (wildcards > 0 ? `, ${wildcards} wildcard ignored` : '') +
+              (preexisting > 0 ? `, ${preexisting} already present` : '') +
+              (malformed > 0 ? `, ${malformed} malformed` : '') +
               `) from ${baseURL}` +
               // Say which signal did the filtering, so an unexpected model in
               // the picker is diagnosable without instrumenting the plugin.
@@ -254,6 +336,19 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
               // wrong path.
               (groups?.size ? '' : ' [no /model_group/info — non-chat filtered by name only]'),
           )
+
+          // Name them: a count alone doesn't say which model will read as free.
+          // Capped so a large proxy stays readable — the true total is already
+          // in the fraction above.
+          if (unpricedIds.length > 0) {
+            const shown = unpricedIds.slice(0, UNPRICED_LIST_LIMIT)
+            const rest = unpricedIds.length - shown.length
+            report(
+              'info',
+              `[litellm-pricing]   no pricing: ${shown.join(', ')}` +
+                (rest > 0 ? ` … +${rest} more` : ''),
+            )
+          }
         }
 
         // No outer race: every await inside `work()` is individually bounded
