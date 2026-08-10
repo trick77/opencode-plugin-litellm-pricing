@@ -12,6 +12,8 @@
 // passed the broken build. So `loadPlugins` below reproduces the loader
 // rule instead of approximating it.
 
+import { mkdir, utimes, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import type { Plugin, PluginInput } from '@opencode-ai/plugin'
 
 // --- the loader -----------------------------------------------------------
@@ -95,6 +97,24 @@ export const MODELS_DEV_TABLE = {
       },
     },
   },
+}
+
+/**
+ * Write a cache file the plugin will find, aged as asked.
+ *
+ * `load()` picks its source by cache age, so a scenario that means to exercise
+ * the fresh- or stale-cache branch has to put one there — otherwise it silently
+ * falls through to the shipped snapshot and asserts nothing about caching.
+ * Mirrors the envelope written by `writeCache` in src/catalog.ts; keep `v` in
+ * step with CACHE_SCHEMA.
+ */
+export async function seedCache(providers: unknown[], ageMs: number, v = 1): Promise<void> {
+  const dir = join(process.env.XDG_CACHE_HOME!, 'opencode-plugin-litellm-pricing')
+  await mkdir(dir, { recursive: true })
+  const file = join(dir, 'models-dev.json')
+  await writeFile(file, JSON.stringify({ v, providers }), 'utf8')
+  const when = new Date(Date.now() - ageMs)
+  await utimes(file, when, when)
 }
 
 /** Every `client.app.log` body the plugin wrote, in order. */

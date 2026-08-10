@@ -173,3 +173,25 @@ test('an explicit context_over_200k beats the tiers array', () => {
     output: 4,
   })
 })
+
+// --- the shipped snapshot ---------------------------------------------------
+
+test('the shipped snapshot round-trips into a usable catalog', async () => {
+  // `buildFromProviders` only admits an entry whose `id` is a string, and
+  // `toProviderList` is what supplies it. A snapshot that fails this parses
+  // fine, builds an EMPTY catalog, and quietly puts the blocking fetch back on
+  // every fresh install — so assert the count, not just that it loaded.
+  const { MODELS_DEV_SNAPSHOT } = await import('../src/models-dev-snapshot.ts')
+  const providers = Object.entries(MODELS_DEV_SNAPSHOT as Record<string, { id?: string }>).map(
+    ([id, p]) => ({ ...p, id: typeof p?.id === 'string' ? p.id : id }),
+  )
+  const snapshot = buildFromProviders(providers)
+
+  assert.ok(snapshot.candidateCount > 100, `snapshot has only ${snapshot.candidateCount} models`)
+  assert.deepEqual([...snapshot.matchedProviders], ['azure', 'openai'])
+  // And it prices the real thing, in the real shape.
+  assert.deepEqual(snapshot.resolve('ai-gateway-gpt-5.4')?.limit, {
+    context: 1050000,
+    output: 128000,
+  })
+})

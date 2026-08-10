@@ -13,12 +13,14 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Config } from '@opencode-ai/plugin'
-import { resetCatalogCache } from '../src/catalog.ts'
+import { resetCatalogCache, setSnapshotForTests } from '../src/catalog.ts'
+import { MODELS_DEV_SNAPSHOT } from '../src/models-dev-snapshot.ts'
 import { resetReportedCatalog } from '../src/plugin.ts'
 import {
   CATALOG_PROVIDERS,
   MODELS_DEV_TABLE,
   captureConsole,
+  seedCache,
   fakePluginInput,
   json,
   loadPlugins,
@@ -43,6 +45,10 @@ async function runConfigHook(
     catalogProviders?: unknown[]
     logged?: LoggedEntry[]
     logFails?: boolean
+    /** Put a cache on disk before the run, so a cache branch is exercised. */
+    seed?: { providers: unknown[]; ageMs: number; v?: number }
+    /** Blank the shipped snapshot, to reach the no-table-at-all path. */
+    noSnapshot?: boolean
   } = {},
 ) {
   resetCatalogCache()
@@ -51,6 +57,8 @@ async function runConfigHook(
   // so the suite can neither read the developer's cache nor write to it —
   // otherwise these scenarios pass or fail depending on the host machine.
   process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), 'litellm-pricing-test-'))
+  setSnapshotForTests(opts.noSnapshot ? {} : MODELS_DEV_SNAPSHOT)
+  if (opts.seed) await seedCache(opts.seed.providers, opts.seed.ageMs, opts.seed.v)
   const plugin = await loadTheOnePlugin()
   return captureConsole(() =>
     withFakeProxy(routes, async () => {
@@ -372,28 +380,30 @@ test('a failing app.log never breaks config loading', async () => {
   assert.ok(models['ai-gateway-gpt-5.4'], 'models must still be injected when logging fails')
 })
 
-test('an unavailable catalog is reported, not swallowed into silent $0', async () => {
+test('with no table at all, the failure is reported rather than shown as $0', async () => {
   const baseURL = 'https://proxy-nocatalog.test'
-  // A provider list with no azure/openai entry — the shape a catalog load
-  // failure and an unusable response both collapse to today.
-  const { logs, warns } = await runConfigHook(providerConfig(baseURL), {
-    '/v1/models': () => json({ data: MIXED_MODELS }),
-    '/model_group/info': () => json({ data: [] }),
-    '/api.json': () => json({ 'some-aggregator': { id: 'some-aggregator', models: {} } }),
-  })
+  // Only reachable with the shipped snapshot blanked — which is the point of
+  // shipping it. Kept covered because this is the path that has to EXPLAIN a
+  // priceless startup, and an unexplained $0 is what started all of this.
+  const { logs, warns } = await runConfigHook(
+    providerConfig(baseURL),
+    {
+      '/v1/models': () => json({ data: MIXED_MODELS }),
+      '/model_group/info': () => json({ data: [] }),
+      '/api.json': () => json({ 'some-aggregator': { id: 'some-aggregator', models: {} } }),
+    },
+    { noSnapshot: true },
+  )
   const all = [...logs, ...warns]
 
   assert.ok(
-    warns.some((l) => l.includes('no priceable providers')),
+    warns.some((l) => l.includes('catalog unavailable')),
     `expected a catalog warning, got: ${all.join(' | ')}`,
   )
-  // And the summary must warn too: added > 0 with priced === 0 is the
-  // systematic-failure shape, not an informational result.
-  // And nothing is repriced later, because there is no catalog to reprice
-  // from — the warning above is the only explanation the user will get.
+  // added > 0 with priced === 0 is the systematic-failure shape, so it warns.
   assert.ok(
-    !all.some((l) => l.includes('catalog arrived late')),
-    `expected no late pricing without a catalog, got: ${all.join(' | ')}`,
+    warns.some((l) => l.includes('pricing for 0/2')),
+    `expected the zero-coverage summary to warn, got: ${all.join(' | ')}`,
   )
 })
 
@@ -404,11 +414,97 @@ test('a working catalog reports its size and source', async () => {
     '/model_group/info': () => json({ data: [] }),
   })
 
-  // This line is what separates "the catalog never loaded" from "the catalog
-  // loaded and nothing matched" — the two causes of a clean zero.
+  // This line separates "no table loaded" from "table loaded, nothing matched"
+  // — the two causes of a clean zero — and now also names WHICH of the four
+  // sources answered, since that is what explains a slow or stale start.
   assert.ok(
-    logs.some((l) => l.includes('catalog:') && l.includes('models.dev')),
-    `expected a catalog line, got: ${logs.join(' | ')}`,
+    logs.some((l) => l.includes('catalog:') && l.includes('snapshot')),
+    `expected a catalog line naming the snapshot, got: ${logs.join(' | ')}`,
+  )
+})
+
+// --- where the price table comes from ---------------------------------------
+//
+// load() answers from disk or from the shipped snapshot and never makes the
+// user wait on the network. Each branch is pinned by its source string: a
+// mis-wired cache still prices correctly (via the snapshot) while having
+// silently stopped caching, so asserting "it was priced" proves nothing.
+
+const ONE_HOUR = 60 * 60 * 1000
+const EIGHT_DAYS = 8 * 24 * ONE_HOUR
+
+/** A cached table, in the post-toProviderList array shape writeCache stores. */
+const CACHED_TABLE = [
+  {
+    id: 'azure',
+    models: {
+      'gpt-5.4': { id: 'gpt-5.4', cost: { input: 1.11, output: 2.22 }, limit: { context: 10, output: 20 } },
+    },
+  },
+]
+
+const PROXY_ROUTES = {
+  '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
+  '/model_group/info': () => json({ data: [] }),
+}
+
+function costOf(result: Record<string, unknown>): unknown {
+  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
+    PROVIDER_KEY
+  ]!.models
+  return (models['ai-gateway-gpt-5.4'] as Record<string, unknown>).cost
+}
+
+test('a fresh cache answers, without touching the network', async () => {
+  const { result, logs } = await runConfigHook(providerConfig('https://proxy-fresh.test'), {
+    ...PROXY_ROUTES,
+    // Reaching models.dev at all on this path is the failure.
+    '/api.json': () => {
+      throw new Error('should not fetch when the cache is fresh')
+    },
+  }, { seed: { providers: CACHED_TABLE, ageMs: ONE_HOUR } })
+
+  assert.deepEqual(costOf(result), { input: 1.11, output: 2.22 })
+  assert.ok(
+    logs.some((l) => l.includes('catalog:') && l.includes('from cache')),
+    `expected the cache named as source, got: ${logs.join(' | ')}`,
+  )
+})
+
+test('a stale cache still answers immediately, refreshing behind it', async () => {
+  // Week-old list prices beat making someone wait. Before this, a stale cache
+  // was only consulted AFTER the fetch had already failed — so a slow network
+  // stalled startup even though a perfectly usable table sat on disk.
+  const { result, logs } = await runConfigHook(
+    providerConfig('https://proxy-stale.test'),
+    PROXY_ROUTES,
+    { seed: { providers: CACHED_TABLE, ageMs: EIGHT_DAYS } },
+  )
+
+  assert.deepEqual(costOf(result), { input: 1.11, output: 2.22 })
+  assert.ok(
+    logs.some((l) => l.includes('stale cache (refreshing)')),
+    `expected the stale-cache source, got: ${logs.join(' | ')}`,
+  )
+})
+
+test('a cache written by an older schema is discarded, not half-read', async () => {
+  // The cache holds a TRIMMED table, so its layout is tied to
+  // PREFERRED_PROVIDERS and to the fields toCatalogFields reads. Serving an old
+  // layout would quietly price nothing from a newly added provider.
+  const { logs } = await runConfigHook(providerConfig('https://proxy-schema.test'), PROXY_ROUTES, {
+    seed: { providers: CACHED_TABLE, ageMs: ONE_HOUR, v: 0 },
+  })
+
+  // Asserting on the SOURCE, not on "it was priced": the snapshot would price
+  // this correctly either way, hiding a cache that had stopped being read.
+  assert.ok(
+    logs.some((l) => l.includes('catalog:') && l.includes('snapshot')),
+    `expected the stale-schema cache to be discarded, got: ${logs.join(' | ')}`,
+  )
+  assert.ok(
+    !logs.some((l) => l.includes('from cache')),
+    `expected no cache hit, got: ${logs.join(' | ')}`,
   )
 })
 
@@ -441,25 +537,29 @@ test('prices from models.dev, including the model parameters', async () => {
   assert.deepEqual(entry.modalities, { input: ['text', 'image', 'pdf'], output: ['text'] })
 })
 
-test('a models.dev outage is reported, not swallowed into silent $0', async () => {
+test('a models.dev outage costs nothing: the shipped snapshot prices anyway', async () => {
   const baseURL = 'https://proxy-outage.test'
-  const { result, warns } = await runConfigHook(providerConfig(baseURL), {
-    '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
-    '/model_group/info': () => json({ data: [] }),
+  // On a fresh install with no cache, this used to be the 10s stall that then
+  // priced nothing. The snapshot makes it a non-event.
+  const { result, logs, warns } = await runConfigHook(providerConfig(baseURL), {
+    ...PROXY_ROUTES,
     '/api.json': () => {
       throw new Error('network down')
     },
   })
 
-  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
-    PROVIDER_KEY
-  ]!.models
-  // The model still reaches the picker — unpriced beats absent.
-  assert.ok(models['ai-gateway-gpt-5.4'], 'the model must still be injected')
+  assert.deepEqual(costOf(result), {
+    input: 2.5,
+    output: 15,
+    cache_read: 0.25,
+    context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
+  })
   assert.ok(
-    warns.some((l) => l.includes('catalog unavailable')),
-    `expected an explicit warning, got: ${warns.join(' | ')}`,
+    logs.some((l) => l.includes('snapshot (refreshing)')),
+    `expected the snapshot source, got: ${logs.join(' | ')}`,
   )
+  // Nothing is wrong here, so nothing may warn.
+  assert.equal(warns.length, 0, `expected no warnings, got: ${warns.join(' | ')}`)
 })
 
 test('an SDK without client.app.log does not lose every model', async () => {
