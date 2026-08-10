@@ -6,9 +6,9 @@ model picker — each with a **real per-model `cost` block**, so OpenCode shows
 real pricing instead of `$0`.
 
 The proxy is asked only for its **model list**. Pricing is never requested from
-it: each model is matched by **name** against OpenCode's own models.dev catalog,
-so `ai-gateway-gpt-5.4` is priced as `gpt-5.4`. Same answer for every key, one
-code path. See [How pricing works](#how-pricing-works).
+it: each model is matched by **name** against the models.dev price table, so
+`ai-gateway-gpt-5.4` is priced as `gpt-5.4`. Same answer for every key, one code
+path. See [How pricing works](#how-pricing-works).
 
 > **Renamed in 0.3.0.** This package was `opencode-litellm-pricing`. npm has no
 > rename, so that package is deprecated and frozen at 0.2.0 — which does not
@@ -54,11 +54,29 @@ chat-capable one into the picker with a config entry like:
 }
 ```
 
-Cost, limits and capabilities come from **OpenCode's own models.dev catalog**
-(via the plugin client — no external fetch), matched to each LiteLLM model by
-name: `ai-gateway-gpt-5.4` → `gpt-5.4`, longest-match so `…-mini` beats the
-base, `azure` preferred over `openai`. These are public list prices, not your
-negotiated rates.
+Cost, limits and capabilities come from the **models.dev price table**, matched
+to each LiteLLM model by name: `ai-gateway-gpt-5.4` → `gpt-5.4`, longest-match
+so `…-mini` beats the base, `azure` preferred over `openai`. These are public
+list prices, not your negotiated rates.
+
+The table is fetched once from `https://models.dev/api.json` and cached for 24
+hours under `$XDG_CACHE_HOME/opencode-plugin-litellm-pricing/` (`~/.cache/…` by
+default), so normal startups touch no network at all. If the fetch fails a stale
+cache is used; if there is no cache either, models are still injected — just
+without a `cost` block — and the startup log says so.
+
+**Why not read the table from OpenCode?** It has one, and asking for it would
+avoid the fetch. It cannot be done: OpenCode's server is unable to answer a
+request while a plugin is blocked waiting on it, so awaiting that call during
+plugin load deadlocks — measured at 60 s, versus 351 ms for the identical call
+left unawaited, which lands after the `config` hook has already run. And that
+hook runs exactly once, so there is no later pass to fill prices into. Earlier
+releases did ask OpenCode, which is why they injected every model at `$0`.
+
+Its other list also carries only the providers *you* have configured: with no
+Azure credentials there is no `azure` entry at all, and the `openai` entry
+OpenCode returns reports every cost as `0` — so a correctly-named model would
+still have been priced at zero.
 
 **Why not read LiteLLM's own numbers?** `/v1/model/info` carries them, but its
 figures are only correct when the deployment has `model_info.base_model` set
@@ -94,6 +112,32 @@ positive hides a model you can actually use: `amazon.nova-pro-v1` and
 `gpt-4o-audio-preview` stay in the picker. The cost of that caution is that an
 oddly-named non-chat model can slip through when the name is all we have.
 
+## The startup log
+
+Every message goes both to the opencode server's stdout and to opencode's own
+log file, `~/.local/share/opencode/log/opencode.log` — so it can still be read
+afterwards, or from a session that isn't attached to that stdout:
+
+```
+grep litellm-pricing ~/.local/share/opencode/log/opencode.log
+```
+
+A healthy run looks like this:
+
+```
+[litellm-pricing] catalog: 129 model(s) from https://models.dev/api.json (azure, openai)
+[litellm-pricing] provider "litellm": 41 discovered, 34 added, pricing for 31/34
+  (5 non-chat hidden, 2 wildcard ignored) from https://litellm.example.com
+[litellm-pricing]   no pricing: my-finetune-v2, internal-router, … +1 more
+```
+
+Coverage is stated over the models actually **added**, not over everything
+discovered: non-chat and wildcard entries never reach the picker, so they can't
+bill anything. The unpriced models are named because a count alone doesn't say
+which one will read as free. `pricing for 0/N` is logged as a **warning**, not
+as info — that shape means something is systematically wrong, usually the
+catalog line above reporting that it was unavailable or empty.
+
 ## Provider matching
 
 The plugin enriches any provider whose id is `opencode-plugin-litellm-pricing`
@@ -109,6 +153,7 @@ the plugin does nothing.
 - OpenCode with plugin support
 - Node 22+
 - A reachable LiteLLM proxy
+- Outbound access to `models.dev` on first run (cached for 24h afterwards)
 
 ## Releasing
 

@@ -9,15 +9,21 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Config } from '@opencode-ai/plugin'
 import { resetCatalogCache } from '../src/catalog.ts'
+import { resetReportedCatalog } from '../src/plugin.ts'
 import {
   CATALOG_PROVIDERS,
+  MODELS_DEV_TABLE,
   captureConsole,
   fakePluginInput,
   json,
   loadPlugins,
   withFakeProxy,
+  type LoggedEntry,
   type Routes,
 } from './helpers/fake-opencode-host.ts'
 
@@ -30,12 +36,32 @@ async function loadTheOnePlugin() {
 }
 
 /** Load, instantiate and run the `config` hook over `config`, capturing output. */
-async function runConfigHook(config: Record<string, unknown>, routes: Routes) {
+async function runConfigHook(
+  config: Record<string, unknown>,
+  routes: Routes,
+  opts: {
+    catalogProviders?: unknown[]
+    logged?: LoggedEntry[]
+    logFails?: boolean
+  } = {},
+) {
   resetCatalogCache()
+  resetReportedCatalog()
+  // The catalog is cached on disk between runs. Point that at a throwaway dir
+  // so the suite can neither read the developer's cache nor write to it —
+  // otherwise these scenarios pass or fail depending on the host machine.
+  process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), 'litellm-pricing-test-'))
   const plugin = await loadTheOnePlugin()
   return captureConsole(() =>
     withFakeProxy(routes, async () => {
-      const hooks = await plugin(fakePluginInput(CATALOG_PROVIDERS))
+      const input = fakePluginInput(opts.catalogProviders ?? CATALOG_PROVIDERS, {
+        logged: opts.logged,
+        logFails: opts.logFails,
+      })
+      // Once, because that is what opencode does — measured under both
+      // `opencode serve` and the CLI. There is no second pass to fall back on,
+      // which is why the price table has to be loaded before the hook runs.
+      const hooks = await plugin(input)
       await hooks.config?.(config as unknown as Config)
       return config
     }),
@@ -113,12 +139,17 @@ test('injects discovered models with catalog pricing into the config', async () 
   assert.deepEqual(entry.limit, { context: 1050000, output: 128000 })
   // Priced from the models.dev catalog by name-match, never from the proxy.
   // No cache_write: a zero cache tier is dropped rather than reported as free.
-  assert.deepEqual(entry.cost, { input: 2.5, output: 15, cache_read: 0.25 })
+  assert.deepEqual(entry.cost, {
+    input: 2.5,
+    output: 15,
+    cache_read: 0.25,
+    context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
+  })
   assert.equal(entry.tool_call, true)
 
   assert.ok(
-    logs.some((l) => l.includes('1 model(s) added') && l.includes('1 with pricing')),
-    `expected a summary line, got: ${logs.join(' | ')}`,
+    logs.some((l) => l.includes('1 discovered, 1 added, pricing for 1/1')),
+    `expected a priced summary, got: ${logs.join(' | ')}`,
   )
 })
 
@@ -168,7 +199,12 @@ test('the pre-rename provider id is still matched', async () => {
   assert.ok(entry, 'the legacy provider id should still be enriched')
   // Pricing specifically — a matched-but-unpriced entry would be the silent
   // half-failure this guarantee exists to rule out.
-  assert.deepEqual(entry.cost, { input: 2.5, output: 15, cache_read: 0.25 })
+  assert.deepEqual(entry.cost, {
+    input: 2.5,
+    output: 15,
+    cache_read: 0.25,
+    context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
+  })
 })
 
 // 3c — matching must not have become a free-for-all.
@@ -251,7 +287,209 @@ test('existing hand-curated model entries are never overwritten', async () => {
   // discovery never ran. The summary line proves the model WAS discovered and
   // then deliberately skipped.
   assert.ok(
-    logs.some((l) => l.includes('0 model(s) added')),
+    logs.some((l) => l.includes('1 discovered, 0 added') && l.includes('1 already present')),
     `expected discovery to have run and added nothing, got: ${logs.join(' | ')}`,
   )
+})
+
+// --- startup reporting ------------------------------------------------------
+//
+// A summary that only ever prints an absolute "N with pricing" can't be read:
+// it says nothing about how many models LiteLLM actually offered, and a run
+// that prices nothing looks the same as a run with nothing to price. These
+// scenarios pin the numbers and the sinks.
+
+/** Three chat models plus one non-chat and one wildcard — nothing is priced. */
+const MIXED_MODELS = [
+  { id: 'ai-gateway-gpt-5.4', object: 'model' },
+  { id: 'some-unknown-llama-thing', object: 'model' },
+  { id: 'text-embedding-3-large', object: 'model' },
+  { id: 'deepseek/*', object: 'model' },
+]
+
+test('the summary accounts for every discovered model, and names the unpriced', async () => {
+  const baseURL = 'https://proxy-summary.test'
+  const { logs, warns } = await runConfigHook(providerConfig(baseURL), {
+    '/v1/models': () => json({ data: MIXED_MODELS }),
+    '/model_group/info': () => json({ data: [] }),
+  })
+  const all = [...logs, ...warns]
+
+  // 4 discovered = 2 added + 1 non-chat + 1 wildcard, and of the 2 added only
+  // ai-gateway-gpt-5.4 has a catalog match.
+  assert.ok(
+    all.some((l) => l.includes('4 discovered, 2 added')),
+    `expected an accounted summary, got: ${all.join(' | ')}`,
+  )
+  assert.ok(
+    all.some((l) => l.includes('no pricing: some-unknown-llama-thing')),
+    `expected the unpriced model named, got: ${all.join(' | ')}`,
+  )
+  assert.ok(
+    all.some((l) => l.includes('1 non-chat hidden') && l.includes('1 wildcard ignored')),
+    `expected the non-chat and wildcard clauses, got: ${all.join(' | ')}`,
+  )
+})
+
+test('every reported line is also written to opencode own log', async () => {
+  const baseURL = 'https://proxy-applog.test'
+  const logged: LoggedEntry[] = []
+  const { logs, warns } = await runConfigHook(
+    providerConfig(baseURL),
+    {
+      '/v1/models': () => json({ data: MIXED_MODELS }),
+      '/model_group/info': () => json({ data: [] }),
+    },
+    { logged },
+  )
+
+  // console alone never reaches ~/.local/share/opencode/log/opencode.log, so
+  // the summary would be unretrievable after the fact.
+  assert.ok(logged.length > 0, 'expected app.log to have been written')
+  assert.ok(logged.every((e) => e.service === 'litellm-pricing'))
+  for (const line of [...logs, ...warns]) {
+    assert.ok(
+      logged.some((e) => e.message === line),
+      `console line was not mirrored to app.log: ${line}`,
+    )
+  }
+})
+
+test('a failing app.log never breaks config loading', async () => {
+  const baseURL = 'https://proxy-logfail.test'
+  const { result } = await runConfigHook(
+    providerConfig(baseURL),
+    {
+      '/v1/models': () => json({ data: MIXED_MODELS }),
+      '/model_group/info': () => json({ data: [] }),
+    },
+    { logFails: true },
+  )
+
+  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
+    PROVIDER_KEY
+  ]!.models
+  assert.ok(models['ai-gateway-gpt-5.4'], 'models must still be injected when logging fails')
+})
+
+test('an unavailable catalog is reported, not swallowed into silent $0', async () => {
+  const baseURL = 'https://proxy-nocatalog.test'
+  // A provider list with no azure/openai entry — the shape a catalog load
+  // failure and an unusable response both collapse to today.
+  const { logs, warns } = await runConfigHook(providerConfig(baseURL), {
+    '/v1/models': () => json({ data: MIXED_MODELS }),
+    '/model_group/info': () => json({ data: [] }),
+    '/api.json': () => json({ 'some-aggregator': { id: 'some-aggregator', models: {} } }),
+  })
+  const all = [...logs, ...warns]
+
+  assert.ok(
+    warns.some((l) => l.includes('no priceable providers')),
+    `expected a catalog warning, got: ${all.join(' | ')}`,
+  )
+  // And the summary must warn too: added > 0 with priced === 0 is the
+  // systematic-failure shape, not an informational result.
+  // And nothing is repriced later, because there is no catalog to reprice
+  // from — the warning above is the only explanation the user will get.
+  assert.ok(
+    !all.some((l) => l.includes('catalog arrived late')),
+    `expected no late pricing without a catalog, got: ${all.join(' | ')}`,
+  )
+})
+
+test('a working catalog reports its size and source', async () => {
+  const baseURL = 'https://proxy-catalogok.test'
+  const { logs } = await runConfigHook(providerConfig(baseURL), {
+    '/v1/models': () => json({ data: MIXED_MODELS }),
+    '/model_group/info': () => json({ data: [] }),
+  })
+
+  // This line is what separates "the catalog never loaded" from "the catalog
+  // loaded and nothing matched" — the two causes of a clean zero.
+  assert.ok(
+    logs.some((l) => l.includes('catalog:') && l.includes('models.dev')),
+    `expected a catalog line, got: ${logs.join(' | ')}`,
+  )
+})
+
+test('prices from models.dev, including the model parameters', async () => {
+  const baseURL = 'https://proxy-source.test'
+  // The price table is served in models.dev's own published shape — flat
+  // capabilities and cache costs — which is not the shape opencode's provider
+  // list uses. Both must parse, or a price silently disappears.
+  const { result } = await runConfigHook(providerConfig(baseURL), {
+    '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
+    '/model_group/info': () => json({ data: [] }),
+    '/api.json': () => json(MODELS_DEV_TABLE),
+  })
+
+  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
+    PROVIDER_KEY
+  ]!.models
+  const entry = models['ai-gateway-gpt-5.4'] as Record<string, unknown>
+  assert.deepEqual(entry.cost, {
+    input: 2.5,
+    output: 15,
+    cache_read: 0.25,
+    context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
+  })
+  // Context size and the other model parameters ride along on the same match.
+  assert.deepEqual(entry.limit, { context: 1050000, output: 128000 })
+  assert.equal(entry.tool_call, true)
+  assert.equal(entry.reasoning, true)
+  assert.equal(entry.attachment, true)
+  assert.deepEqual(entry.modalities, { input: ['text', 'image', 'pdf'], output: ['text'] })
+})
+
+test('a models.dev outage is reported, not swallowed into silent $0', async () => {
+  const baseURL = 'https://proxy-outage.test'
+  const { result, warns } = await runConfigHook(providerConfig(baseURL), {
+    '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
+    '/model_group/info': () => json({ data: [] }),
+    '/api.json': () => {
+      throw new Error('network down')
+    },
+  })
+
+  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
+    PROVIDER_KEY
+  ]!.models
+  // The model still reaches the picker — unpriced beats absent.
+  assert.ok(models['ai-gateway-gpt-5.4'], 'the model must still be injected')
+  assert.ok(
+    warns.some((l) => l.includes('catalog unavailable')),
+    `expected an explicit warning, got: ${warns.join(' | ')}`,
+  )
+})
+
+test('an SDK without client.app.log does not lose every model', async () => {
+  const baseURL = 'https://proxy-nolog.test'
+  // Older opencode builds have no /log endpoint. The property access throws
+  // synchronously, which `.catch()` cannot see — and an escaped throw here
+  // takes the whole config hook down with it.
+  resetCatalogCache()
+  resetReportedCatalog()
+  process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), 'litellm-pricing-test-'))
+  const plugin = await loadTheOnePlugin()
+  const config = providerConfig(baseURL)
+  const { result } = await captureConsole(() =>
+    withFakeProxy(
+      {
+        '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
+        '/model_group/info': () => json({ data: [] }),
+      },
+      async () => {
+        const input = fakePluginInput(CATALOG_PROVIDERS)
+        delete (input.client as unknown as Record<string, unknown>).app
+        const hooks = await plugin(input)
+        await hooks.config?.(config as unknown as Config)
+        return config
+      },
+    ),
+  )
+
+  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
+    PROVIDER_KEY
+  ]!.models
+  assert.ok(models['ai-gateway-gpt-5.4'], 'the model must survive an unloggable host')
 })

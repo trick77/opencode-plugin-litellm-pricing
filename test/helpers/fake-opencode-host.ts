@@ -69,16 +69,79 @@ export function loadPlugins(mod: object): Plugin[] {
 // --- the plugin input -----------------------------------------------------
 
 /**
- * The only member this plugin touches is `client.config.providers({})` — see
- * `load()` in src/catalog.ts. Everything else on PluginInput is left off and
- * the whole thing cast, so a test fails loudly if the plugin ever starts
- * reaching for something new rather than silently reading `undefined`.
+ * The price table as models.dev actually publishes it: an object keyed by
+ * provider id, with capabilities and cache costs FLAT (`tool_call`,
+ * `cost.cache_read`, `modalities.input` as a string array). opencode's own
+ * provider list nests the same information, so the two fixtures together prove
+ * `toCatalogFields` reads both.
  */
-export function fakePluginInput(providers: unknown[]): PluginInput {
+export const MODELS_DEV_TABLE = {
+  azure: {
+    id: 'azure',
+    models: {
+      'gpt-5.4': {
+        id: 'gpt-5.4',
+        cost: {
+          input: 2.5,
+          output: 15,
+          cache_read: 0.25,
+          tiers: [{ input: 5, output: 22.5, cache_read: 0.5, tier: { type: 'context', size: 272000 } }],
+        },
+        limit: { context: 1050000, input: 922000, output: 128000 },
+        reasoning: true,
+        tool_call: true,
+        attachment: true,
+        modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
+      },
+    },
+  },
+}
+
+/** Every `client.app.log` body the plugin wrote, in order. */
+export interface LoggedEntry {
+  service: string
+  level: string
+  message: string
+}
+
+/**
+ * The members this plugin touches are `client.provider.list({})` and
+ * `client.config.providers({})` — see
+ * `load()` in src/catalog.ts — and `client.app.log({...})`, the only path into
+ * opencode's own log file. Everything else on PluginInput is left off and the
+ * whole thing cast, so a test fails loudly if the plugin ever starts reaching
+ * for something new rather than silently reading `undefined`.
+ *
+ * Note this stub cannot verify the *shape* of the app.log call: it is
+ * hand-written, so it matches whatever the plugin does. `tsc --noEmit` against
+ * the real SDK types is what guards that.
+ */
+export function fakePluginInput(
+  providers: unknown[],
+  opts: {
+    logged?: LoggedEntry[]
+    logFails?: boolean
+    /** What /provider serves. Omit to serve the same list as config.providers. */
+    all?: unknown[]
+    /** Drop /provider entirely, as an older opencode would. */
+    noProviderList?: boolean
+  } = {},
+): PluginInput {
+  const provider = opts.noProviderList
+    ? undefined
+    : { list: async () => ({ data: { all: opts.all ?? providers } }) }
   return {
     client: {
+      provider,
       config: {
         providers: async () => ({ data: { providers } }),
+      },
+      app: {
+        log: async (options: { body: LoggedEntry }) => {
+          if (opts.logFails) throw new Error('log endpoint unavailable')
+          opts.logged?.push(options.body)
+          return {}
+        },
       },
     },
   } as unknown as PluginInput
@@ -133,10 +196,14 @@ export async function withFakeProxy<T>(routes: Routes, fn: () => Promise<T>): Pr
   const real = globalThis.fetch
   const stub = async (input: unknown): Promise<Response> => {
     const url = new URL(String(input))
-    const route = routes[url.pathname]
+    // The price table is fetched from models.dev, not from the proxy — see
+    // load() in src/catalog.ts. Scenarios that don't care get the default
+    // table; one that does can override the route.
+    const route = routes[url.pathname] ?? (url.host === 'models.dev' ? modelsDev : undefined)
     if (!route) throw new Error(`fake proxy: no route for ${url.pathname}`)
     return route()
   }
+  const modelsDev = () => json(MODELS_DEV_TABLE)
   globalThis.fetch = stub as unknown as typeof globalThis.fetch
   try {
     return await fn()
