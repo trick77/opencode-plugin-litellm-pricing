@@ -10,7 +10,7 @@
 // then silently bills $0. Name-matching gives the same answer for every key,
 // through one code path.
 
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { PluginInput } from '@opencode-ai/plugin'
@@ -153,12 +153,18 @@ async function readCache(): Promise<{ providers: unknown[]; ageMs: number } | nu
 }
 
 async function writeCache(text: string): Promise<void> {
+  const path = cachePath()
+  // Write-then-rename, pid-scoped: two opencode processes starting at once
+  // would otherwise interleave into a truncated file that never parses again
+  // until the next successful fetch. rename() is atomic within a filesystem.
+  const tmp = `${path}.${process.pid}.tmp`
   try {
-    const path = cachePath()
     await mkdir(dirname(path), { recursive: true })
-    await writeFile(path, text, 'utf8')
+    await writeFile(tmp, text, 'utf8')
+    await rename(tmp, path)
   } catch {
     // A cache we cannot write is not a reason to fail the load.
+    await rm(tmp, { force: true }).catch(() => {})
   }
 }
 
@@ -346,6 +352,7 @@ function toCost(raw: unknown): CostBlock | undefined {
         cache_read?: unknown
         cache_write?: unknown
         tiers?: unknown
+        context_over_200k?: unknown
         experimentalOver200K?: unknown
       }
     | undefined
@@ -360,10 +367,17 @@ function toCost(raw: unknown): CostBlock | undefined {
   if (cacheRead) block.cache_read = cacheRead
   if (cacheWrite) block.cache_write = cacheWrite
 
-  // The over-200k tier is `experimentalOver200K` in opencode's list and the
-  // first entry of `cost.tiers` in models.dev's.
+  // The over-200k tier is `experimentalOver200K` in opencode's list and
+  // `cost.context_over_200k` in models.dev's. models.dev also publishes a
+  // `cost.tiers[]` array, but its first entry is NOT necessarily the 200k
+  // band — thresholds range from 16k to 512k, and models.dev omits
+  // `context_over_200k` precisely when no tier reaches 200k. Reading tiers[0]
+  // blind would label a 32k-band price as the over-200k price. Fall back to it
+  // only when its own threshold says it qualifies.
   const tiers = Array.isArray(cost?.tiers) ? cost.tiers : []
-  const over = (cost?.experimentalOver200K ?? tiers[0]) as
+  const firstTierSize = num((tiers[0] as { tier?: { size?: unknown } } | undefined)?.tier?.size)
+  const tierFallback = firstTierSize != null && firstTierSize >= 200_000 ? tiers[0] : undefined
+  const over = (cost?.experimentalOver200K ?? cost?.context_over_200k ?? tierFallback) as
     | {
         input?: unknown
         output?: unknown

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-plugin-litellm-pricing",
-  "version": "0.3.0",
-  "description": "OpenCode plugin: dynamic LiteLLM model discovery with real per-model pricing, matched by name against OpenCode's own models.dev catalog",
+  "version": "0.4.0",
+  "description": "OpenCode plugin: dynamic LiteLLM model discovery with real per-model pricing, matched by name against the models.dev price table",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {

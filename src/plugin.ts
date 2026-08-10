@@ -124,13 +124,25 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
   // "why does this model show $0?" after the fact will actually look.
   //
   // Fire-and-forget on purpose: client calls made from inside the `config`
-  // hook are re-entrant (see the comment on withTimeout in catalog.ts), so
-  // awaiting one here risks stalling startup. A failed log must never be
-  // able to break config loading either.
+  // hook are re-entrant (see the comment on load() in catalog.ts), so awaiting
+  // one here risks stalling startup. A failed log must never be able to break
+  // config loading either — hence try/catch and not just `.catch()`: an SDK
+  // without `client.app.log` throws synchronously, and that throw would escape
+  // the hook and lose every injected model.
   const report = (level: 'info' | 'warn', message: string) => {
-    if (level === 'warn') console.warn(message)
-    else console.log(message)
-    void input.client.app.log({ body: { service: 'litellm-pricing', level, message } }).catch(() => {})
+    try {
+      if (level === 'warn') console.warn(message)
+      else console.log(message)
+    } catch {
+      // A console that cannot be written to is not a reason to fail the hook.
+    }
+    try {
+      void input.client.app
+        .log({ body: { service: 'litellm-pricing', level, message } })
+        .catch(() => {})
+    } catch {
+      // Ditto for opencode's own log.
+    }
   }
 
   return {
@@ -331,6 +343,7 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
               ` (${skipped} non-chat hidden` +
               (wildcards > 0 ? `, ${wildcards} wildcard ignored` : '') +
               (preexisting > 0 ? `, ${preexisting} already present` : '') +
+              (reinjected > 0 ? `, ${reinjected} already injected` : '') +
               (malformed > 0 ? `, ${malformed} malformed` : '') +
               `) from ${baseURL}` +
               // Say which signal did the filtering, so an unexpected model in

@@ -461,3 +461,35 @@ test('a models.dev outage is reported, not swallowed into silent $0', async () =
     `expected an explicit warning, got: ${warns.join(' | ')}`,
   )
 })
+
+test('an SDK without client.app.log does not lose every model', async () => {
+  const baseURL = 'https://proxy-nolog.test'
+  // Older opencode builds have no /log endpoint. The property access throws
+  // synchronously, which `.catch()` cannot see — and an escaped throw here
+  // takes the whole config hook down with it.
+  resetCatalogCache()
+  resetReportedCatalog()
+  process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), 'litellm-pricing-test-'))
+  const plugin = await loadTheOnePlugin()
+  const config = providerConfig(baseURL)
+  const { result } = await captureConsole(() =>
+    withFakeProxy(
+      {
+        '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
+        '/model_group/info': () => json({ data: [] }),
+      },
+      async () => {
+        const input = fakePluginInput(CATALOG_PROVIDERS)
+        delete (input.client as unknown as Record<string, unknown>).app
+        const hooks = await plugin(input)
+        await hooks.config?.(config as unknown as Config)
+        return config
+      },
+    ),
+  )
+
+  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
+    PROVIDER_KEY
+  ]!.models
+  assert.ok(models['ai-gateway-gpt-5.4'], 'the model must survive an unloggable host')
+})

@@ -65,7 +65,9 @@ then `cd test/probe && opencode models`.
   (free tier); drop only absent values.
 - Tiering: map LiteLLM `*_above_200k_tokens` → `context_over_200k`. Do NOT map
   `*_above_272k_tokens` (would overcharge the 200k–272k band). models.dev path
-  maps `experimentalOver200K`, else the first `cost.tiers[]` entry.
+  maps `experimentalOver200K`, else `cost.context_over_200k`, else
+  `cost.tiers[0]` ONLY when its own `tier.size >= 200000` — tier thresholds run
+  16k–512k, so an ungated `tiers[0]` labels a 32k-band price as over-200k.
 
 ## LiteLLM field semantics
 
