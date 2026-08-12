@@ -125,7 +125,7 @@ test('configModelFromCatalog: filters non-chat by name, applies catalog fields t
 })
 
 test('catalog modalities are unioned with LiteLLM flags, never shrunk by them', () => {
-  // LiteLLM's group info reports vision only; models.dev also knows pdf. The
+  // LiteLLM's group info reports vision only; the price table also knows pdf. The
   // narrower proxy answer must not drop pdf from the injected entry.
   const model = {
     id: 'bedrock-claude',

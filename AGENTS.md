@@ -48,9 +48,11 @@ then `cd test/probe && opencode models`.
   `{ input, output, cache_read, cache_write, context_over_200k }`,
   `additionalProperties:false`. NEVER emit a nested `cache` object — the schema
   rejects it and the whole `cost` is dropped. Values are USD per 1M tokens.
-- ONE cost source: the models.dev price table. Costs ALREADY per-1M — copy
-  through, do NOT ×1e6. Never source cost from the proxy (base_model misconfig
-  silently bills $0).
+- ONE cost source: the configured price table, in LiteLLM
+  `model_prices_and_context_window.json` format (`options.pricingURL`, default
+  = LiteLLM's published file). Costs are per-TOKEN — they MUST go through
+  `buildCost`/`perMillion` (×1e6). Never source cost from the proxy
+  (base_model misconfig silently bills $0).
 - NEVER await a fetch on the startup path. The `config` hook runs once, before
   anything renders, so a fetch there is a stall the user sits through. `load()`
   answers from cache (7d) → stale cache → shipped snapshot, each demoting the
@@ -59,31 +61,33 @@ then `cd test/probe && opencode models`.
   pending: opencode exits without draining the event loop (measured: CLI exited
   216ms in with a black-holed 3s fetch outstanding), so it lands in long
   sessions and is simply skipped in short ones.
-- `src/models-dev-snapshot.ts` is GENERATED — `npm run update-snapshot`, never
-  hand-edit. Keep `PREFERRED_PROVIDERS` and the kept-field list in
-  `scripts/update-snapshot.mjs` in step with `catalog.ts` — the script CANNOT
-  import them, `catalog.ts` imports the snapshot it generates. Bump
-  `CACHE_SCHEMA` when the trimmed shape changes or old caches are served as if
-  complete.
+- `src/price-table-snapshot.ts` is GENERATED — `npm run update-snapshot`, never
+  hand-edit. Keep `KEEP_FIELDS` and the URL in `scripts/update-snapshot.mjs` in
+  step with `catalog.ts` — the script CANNOT import them, `catalog.ts` imports
+  the snapshot it generates. Bump `CACHE_SCHEMA` when the trimmed shape changes
+  or old caches are served as if complete.
+- The cache file is keyed by a hash of the price-table URL. Two providers on
+  two tables must never read each other's prices.
+- NEVER filter the table by provider when trimming/caching. Only the SUBSTRING
+  pass is restricted to `azure`/`openai`; the exact-key pass sees everything,
+  and a provider filter would strip out precisely the enriched entries a custom
+  table exists to provide.
 - NEVER pin an upstream price against the real snapshot in a test — it is
   regenerated before every release, so `npm run update-snapshot` would fail the
   suite at tag time. Pass a fixture via the harness `snapshot` option instead.
 - NEVER go back to `client.config.providers()` for cost: deadlocks (above), and
   lists only the reader's configured providers — no Azure creds → no `azure`,
   and its `openai` entry reports every cost as 0 → real models priced $0.
-- Both catalog shapes must parse. models.dev FLAT (`tool_call`,
-  `cost.cache_read`, `cost.tiers[]`, `modalities.input: string[]`); opencode
-  provider list NESTED (`capabilities.toolcall`, `cost.cache.read`,
-  `experimentalOver200K`). Wrong shape → `undefined` → price silently dropped.
-- `perMillion` (per-TOKEN → ×1e6, round 6dp) applies only to the unused
-  `/v1/model/info` reader. Do not wire it into the live path.
+- One table shape: flat, keyed by model name, `litellm_provider` inside the
+  entry, costs per TOKEN. Skip the `sample_spec` key — it is a doc stub.
 - Emit `cost` only when both `input` and `output` are known. Keep a real `0`
   (free tier); drop only absent values.
+- EXCEPTION, table path only (`toCatalogFields`): a cost that is zero across
+  the board is the table saying "no number", not "free" — upstream ships 124
+  such entries, some plainly billable. Drop the whole `cost`; the model is
+  injected unpriced and named in the log. Do NOT move this into `buildCost`.
 - Tiering: map LiteLLM `*_above_200k_tokens` → `context_over_200k`. Do NOT map
-  `*_above_272k_tokens` (would overcharge the 200k–272k band). models.dev path
-  maps `experimentalOver200K`, else `cost.context_over_200k`, else
-  `cost.tiers[0]` ONLY when its own `tier.size >= 200000` — tier thresholds run
-  16k–512k, so an ungated `tiers[0]` labels a 32k-band price as over-200k.
+  `*_above_272k_tokens` (would overcharge the 200k–272k band).
 
 ## LiteLLM field semantics
 
@@ -115,8 +119,9 @@ then `cd test/probe && opencode models`.
   that log call; never let it break config loading.
 - Fail soft: warn and continue; never throw out of the `config` hook. Skip
   malformed entries and wildcard (`*`) ids.
-- models.dev name match: longest-match, boundary-anchored, providers `azure`
-  then `openai` only.
+- Name match: EXACT table key first (case-insensitive, any provider), then
+  bounded substring — longest-match, boundary-anchored, leading `<provider>/`
+  stripped, providers `azure` then `openai` only.
 
 ## Release
 

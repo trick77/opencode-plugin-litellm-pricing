@@ -5,13 +5,19 @@
 // per-model `cost` block, so opencode's cost display matches what LiteLLM
 // bills.
 //
-// Cost comes from one source: the models.dev price table, matched to
-// each model by name (public list prices). The proxy is asked what models the
-// key can see (/v1/models) and what kind of model each one is
-// (/model_group/info) — never for pricing.
+// Cost comes from one source: a price table in LiteLLM's
+// `model_prices_and_context_window.json` format, matched to each model by name
+// (public list prices). The proxy is asked what models the key can see
+// (/v1/models) and what kind of model each one is (/model_group/info) — never
+// for pricing.
 //
 // `options.baseURL` is required. The plugin talks to that URL and nothing
 // else: there is no default and no port auto-detection.
+//
+// `options.pricingURL` is optional and defaults to LiteLLM's own published
+// table. Point it at an enriched copy of that file — same format, plus entries
+// for your gateway's own model names — and those models price by exact name
+// instead of by substring match against the public model line.
 //
 // Configure in opencode.json:
 //
@@ -23,7 +29,8 @@
 //         "name": "LiteLLM (proxy)",
 //         "options": {
 //           "baseURL": "https://litellm.example.com/v1",
-//           "apiKey": "{env:LITELLM_API_KEY}"
+//           "apiKey": "{env:LITELLM_API_KEY}",
+//           "pricingURL": "https://catalog.example.com/model_prices_and_context_window.json"
 //         }
 //       }
 //     }
@@ -39,7 +46,7 @@ import {
   resolveApiKey,
 } from './litellm-api.ts'
 import { configModelFromCatalog, enrichModel, groupInfoToModelInfo } from './build-config-model.ts'
-import { catalogIfReady, getCatalogStatus, preloadCatalog } from './catalog.ts'
+import { DEFAULT_PRICE_TABLE_URL, getCatalog, getCatalogStatus } from './catalog.ts'
 
 // Default provider id — kept identical to the npm package name so the
 // `plugin` and `provider` keys in opencode.json read the same.
@@ -73,12 +80,15 @@ const injectedModelIds = new Map<string, Set<string>>()
 /** How many unpriced model ids to name inline before summarising the rest. */
 const UNPRICED_LIST_LIMIT = 15
 
-/** The catalog is loaded once per process, so report on it once too. */
-let reportedCatalog = false
+/**
+ * Price-table URLs already reported on. The catalog is loaded once per process
+ * per URL, so report on each one once too.
+ */
+const reportedCatalogs = new Set<string>()
 
 /** Clear the once-per-process report guard — used by tests. */
 export function resetReportedCatalog(): void {
-  reportedCatalog = false
+  reportedCatalogs.clear()
 }
 
 /**
@@ -110,13 +120,14 @@ function readCustomHeaders(options: Record<string, unknown>): Record<string, str
 }
 
 export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
-  // The price table must be in hand before the `config` hook runs: opencode
-  // invokes that hook exactly ONCE (measured under both `serve` and the CLI),
-  // so there is no later pass to fill prices in on. See catalog.ts for why the
-  // table is fetched from models.dev rather than asked of opencode — asking
-  // opencode from here deadlocks, which is what used to leave every model
-  // unpriced.
-  await preloadCatalog(input.client)
+  // No catalog preload here. The price-table URL is per-provider config
+  // (`options.pricingURL`), and provider options do not exist until the
+  // `config` hook runs — so the table is loaded there, awaited before any model
+  // is priced. That hook is invoked exactly ONCE (measured under both `serve`
+  // and the CLI), so there is no later pass to fill prices in on, and the load
+  // must therefore be one that is safe to wait on: see catalog.ts, where every
+  // answering branch reads from disk and the network is only ever a background
+  // refresh. Asking opencode itself for the table is what used to deadlock.
 
   // Every message goes to both sinks. console reaches whoever is attached to
   // the opencode server's stdout; client.app.log is the only path into
@@ -151,11 +162,6 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
       if (!config.provider) config.provider = {}
       const providers = config.provider
 
-      // Whatever the catalog knows right now. Never awaited: see the factory.
-      const catalog = catalogIfReady()
-      const resolveCatalog = (name: string): CatalogFields | null =>
-        catalog?.resolve(name) ?? null
-
       // Collect matching providers. No synthesized fallback entry: without a
       // configured baseURL there is nothing to discover, so inventing a
       // provider could only ever produce a warning and an empty model list.
@@ -165,34 +171,6 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
         if (provider && typeof provider === 'object') {
           const options = (provider.options ?? {}) as Record<string, unknown>
           if (isLiteLLMProvider(id, options)) matched.push({ id, provider })
-        }
-      }
-
-      // Only once there is a LiteLLM provider to enrich: with none configured
-      // the plugin does nothing, and a "no pricing" warning would be noise.
-      // Only once the load has settled: 'loading' is not a verdict, and
-      // latching the once-per-process guard on it would suppress the real
-      // reading when it arrives.
-      const status = getCatalogStatus()
-      if (matched.length > 0 && !reportedCatalog && status.state !== 'loading') {
-        reportedCatalog = true
-        // `ok` always carries a non-empty catalog — catalogFrom() returns null
-        // at zero candidates, so a zero-candidate `ok` cannot be constructed.
-        // `snapshot (refreshing)` and `stale cache (refreshing)` are successes
-        // too, not degraded states, and must not warn: they are what keeps
-        // startup off the network.
-        if (status.state === 'ok') {
-          report(
-            'info',
-            `[litellm-pricing] catalog: ${status.candidateCount} model(s) from ` +
-              `${status.source} — ${(status.matchedProviders ?? []).join(', ')}`,
-          )
-        } else {
-          report(
-            'warn',
-            '[litellm-pricing] models.dev catalog unavailable ' +
-              `(${status.reason}) — every model will be injected without pricing.`,
-          )
         }
       }
 
@@ -214,6 +192,54 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           continue
         }
         const baseURL = normalizeBaseURL(configuredBase)
+
+        // The price table this provider prices from, loaded only once the
+        // provider is known to be usable: a provider with no baseURL injects
+        // nothing, so loading (and reporting on) a table for it is pure noise.
+        // Awaiting it is safe — the load answers from the on-disk cache or the
+        // shipped snapshot and only ever refreshes in the background (see
+        // catalog.ts) — and it has to be awaited, because the hook runs once
+        // and there is no second pass.
+        const pricingURL =
+          typeof options.pricingURL === 'string' && options.pricingURL
+            ? options.pricingURL
+            : DEFAULT_PRICE_TABLE_URL
+        const catalog = await getCatalog(pricingURL)
+        const resolveCatalog = (name: string): CatalogFields | null =>
+          catalog?.resolve(name) ?? null
+
+        // Once per price-table URL, not per provider: two providers sharing a
+        // table share its one load, so a second report would only repeat it.
+        if (!reportedCatalogs.has(pricingURL)) {
+          reportedCatalogs.add(pricingURL)
+          const status = getCatalogStatus(pricingURL)
+          // `ok` always carries a non-empty catalog — catalogFrom() returns null
+          // at zero candidates, so a zero-candidate `ok` cannot be constructed.
+          // `snapshot (refreshing)` and `stale cache (refreshing)` are successes
+          // too, not degraded states, and must not warn: they are what keeps
+          // startup off the network.
+          if (status.state === 'ok') {
+            // Name the providers the substring pass can draw on — or say it is
+            // inert, which is what a table carrying neither azure nor openai
+            // entries means: only exact model names will price.
+            // Named `substringProviders`, not `providers`: the enclosing
+            // scope already has a `providers` — the config's provider map.
+            const substringProviders = status.matchedProviders ?? []
+            report(
+              'info',
+              `[litellm-pricing] catalog: ${status.candidateCount} model(s) from ${status.source} — ` +
+                (substringProviders.length > 0
+                  ? `substring match via ${substringProviders.join(', ')}`
+                  : 'exact model names only (no azure/openai entries to match by substring)'),
+            )
+          } else {
+            report(
+              'warn',
+              `[litellm-pricing] price catalog unavailable from ${pricingURL} ` +
+                `(${status.reason}) — every model will be injected without pricing.`,
+            )
+          }
+        }
 
         // Ensure the provider entry exists and is minimally wired.
         if (!providers[providerId]) providers[providerId] = provider
@@ -311,9 +337,10 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
             const group = groups?.get(model.id)
             const enriched = group ? enrichModel(model, groupInfoToModelInfo(group)) : model
 
-            // Name-match against the models.dev catalog: `ai-gateway-gpt-5.4`
-            // resolves to `gpt-5.4` (longest match wins, so `…-mini` beats the
-            // base model).
+            // Name-match against the price table: an exact key wins outright
+            // (an enriched table can carry `ai-gateway/gpt-5.4` itself), and
+            // otherwise `ai-gateway-gpt-5.4` resolves to `gpt-5.4` by bounded
+            // substring (longest match wins, so `…-mini` beats the base model).
             const fields = resolveCatalog(model.id)
             const entry = configModelFromCatalog(enriched, fields)
 

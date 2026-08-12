@@ -9,16 +9,23 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Config } from '@opencode-ai/plugin'
-import { resetCatalogCache, setSnapshotForTests, settleRefreshForTests } from '../src/catalog.ts'
-import { MODELS_DEV_SNAPSHOT } from '../src/models-dev-snapshot.ts'
+import {
+  DEFAULT_PRICE_TABLE_URL,
+  resetCatalogCache,
+  setSnapshotForTests,
+  settleRefreshForTests,
+} from '../src/catalog.ts'
+import { PRICE_TABLE_SNAPSHOT } from '../src/price-table-snapshot.ts'
 import { resetReportedCatalog } from '../src/plugin.ts'
 import {
-  CATALOG_PROVIDERS,
-  MODELS_DEV_TABLE,
+  DEFAULT_PRICE_TABLE_PATHNAME,
+  PRICE_TABLE,
   captureConsole,
   fetchedURLs,
   seedCache,
@@ -46,8 +53,12 @@ async function runConfigHook(
     catalogProviders?: unknown[]
     logged?: LoggedEntry[]
     logFails?: boolean
-    /** Put a cache on disk before the run, so a cache branch is exercised. */
-    seed?: { providers: unknown[]; ageMs: number; v?: number }
+    /**
+     * Put a cache on disk before the run, so a cache branch is exercised. The
+     * cache is keyed by price-table URL, so `url` has to be the one the
+     * scenario's provider will actually resolve — the default otherwise.
+     */
+    seed?: { url?: string; table: unknown; ageMs: number; v?: number }
     /** Blank the shipped snapshot, to reach the no-table-at-all path. */
     noSnapshot?: boolean
     /**
@@ -65,12 +76,19 @@ async function runConfigHook(
   // so the suite can neither read the developer's cache nor write to it —
   // otherwise these scenarios pass or fail depending on the host machine.
   process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), 'litellm-pricing-test-'))
-  setSnapshotForTests(opts.noSnapshot ? {} : (opts.snapshot ?? MODELS_DEV_SNAPSHOT))
-  if (opts.seed) await seedCache(opts.seed.providers, opts.seed.ageMs, opts.seed.v)
+  setSnapshotForTests(opts.noSnapshot ? {} : (opts.snapshot ?? PRICE_TABLE_SNAPSHOT))
+  if (opts.seed) {
+    await seedCache(
+      opts.seed.url ?? DEFAULT_PRICE_TABLE_URL,
+      opts.seed.table,
+      opts.seed.ageMs,
+      opts.seed.v,
+    )
+  }
   const plugin = await loadTheOnePlugin()
   const captured = await captureConsole(() =>
     withFakeProxy(routes, async () => {
-      const input = fakePluginInput(opts.catalogProviders ?? CATALOG_PROVIDERS, {
+      const input = fakePluginInput(opts.catalogProviders ?? [], {
         logged: opts.logged,
         logFails: opts.logFails,
       })
@@ -135,21 +153,28 @@ test('the entry module satisfies opencode\'s plugin loader', async () => {
 // 2 — the happy path, all the way through.
 test('injects discovered models with catalog pricing into the config', async () => {
   const config = providerConfig('https://proxy-inject.test/v1')
-  const { logs } = await runConfigHook(config, {
-    '/v1/models': () => modelsResponse(CHAT_MODEL),
-    '/model_group/info': () =>
-      json({
-        data: [
-          {
-            model_group: 'ai-gateway-gpt-5.4',
-            mode: 'chat',
-            max_input_tokens: 1050000,
-            max_output_tokens: 128000,
-            supports_function_calling: true,
-          },
-        ],
-      }),
-  })
+  const { logs } = await runConfigHook(
+    config,
+    {
+      '/v1/models': () => modelsResponse(CHAT_MODEL),
+      '/model_group/info': () =>
+        json({
+          data: [
+            {
+              model_group: 'ai-gateway-gpt-5.4',
+              mode: 'chat',
+              max_input_tokens: 1050000,
+              max_output_tokens: 128000,
+              supports_function_calling: true,
+            },
+          ],
+        }),
+    },
+    // Priced against the fixture, not the shipped snapshot: the real one is
+    // regenerated before every release, so pinning upstream's current numbers
+    // here would turn `npm run update-snapshot` into a red suite at tag time.
+    { snapshot: PRICE_TABLE },
+  )
 
   const provider = config.provider[PROVIDER_KEY]!
   assert.equal(provider.npm, '@ai-sdk/openai-compatible', 'npm should be defaulted')
@@ -159,8 +184,9 @@ test('injects discovered models with catalog pricing into the config', async () 
   assert.ok(entry, 'the chat model should be injected')
   assert.equal(entry.name, 'AI Gateway GPT 5.4')
   assert.deepEqual(entry.limit, { context: 1050000, output: 128000 })
-  // Priced from the models.dev catalog by name-match, never from the proxy.
-  // No cache_write: a zero cache tier is dropped rather than reported as free.
+  // Priced from the price table by name-match, never from the proxy. No
+  // cache_write: the table states none, and an absent tier is omitted rather
+  // than reported as free.
   assert.deepEqual(entry.cost, {
     input: 2.5,
     output: 15,
@@ -208,10 +234,15 @@ test('the pre-rename provider id is still matched', async () => {
       } as Record<string, unknown>,
     },
   }
-  await runConfigHook(config, {
-    '/v1/models': () => modelsResponse(CHAT_MODEL),
-    '/model_group/info': () => json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
-  })
+  await runConfigHook(
+    config,
+    {
+      '/v1/models': () => modelsResponse(CHAT_MODEL),
+      '/model_group/info': () =>
+        json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
+    },
+    { snapshot: PRICE_TABLE },
+  )
 
   const models = config.provider['opencode-litellm-pricing']!.models as Record<
     string,
@@ -404,7 +435,8 @@ test('with no table at all, the failure is reported rather than shown as $0', as
     {
       '/v1/models': () => json({ data: MIXED_MODELS }),
       '/model_group/info': () => json({ data: [] }),
-      '/api.json': () => json({ 'some-aggregator': { id: 'some-aggregator', models: {} } }),
+      // A table with nothing usable in it: parses, prices nothing.
+      [DEFAULT_PRICE_TABLE_PATHNAME]: () => json({ sample_spec: { litellm_provider: 'none' } }),
     },
     { noSnapshot: true },
   )
@@ -447,15 +479,16 @@ test('a working catalog reports its size and source', async () => {
 const ONE_HOUR = 60 * 60 * 1000
 const EIGHT_DAYS = 8 * 24 * ONE_HOUR
 
-/** A cached table, in the post-toProviderList array shape writeCache stores. */
-const CACHED_TABLE = [
-  {
-    id: 'azure',
-    models: {
-      'gpt-5.4': { id: 'gpt-5.4', cost: { input: 1.11, output: 2.22 }, limit: { context: 10, output: 20 } },
-    },
+/** A cached table, in the trimmed flat shape writeCache stores. */
+const CACHED_TABLE = {
+  'azure/gpt-5.4': {
+    litellm_provider: 'azure',
+    max_input_tokens: 10,
+    max_output_tokens: 20,
+    input_cost_per_token: 0.00000111,
+    output_cost_per_token: 0.00000222,
   },
-]
+}
 
 const PROXY_ROUTES = {
   '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
@@ -470,13 +503,17 @@ function costOf(result: Record<string, unknown>): unknown {
 }
 
 test('a fresh cache answers, without touching the network', async () => {
-  const { result, logs } = await runConfigHook(providerConfig('https://proxy-fresh.test'), {
-    ...PROXY_ROUTES,
-    // Reaching models.dev at all on this path is the failure.
-    '/api.json': () => {
-      throw new Error('should not fetch when the cache is fresh')
+  const { result, logs } = await runConfigHook(
+    providerConfig('https://proxy-fresh.test'),
+    {
+      ...PROXY_ROUTES,
+      // Reaching the price table at all on this path is the failure.
+      [DEFAULT_PRICE_TABLE_PATHNAME]: () => {
+        throw new Error('should not fetch when the cache is fresh')
+      },
     },
-  }, { seed: { providers: CACHED_TABLE, ageMs: ONE_HOUR } })
+    { seed: { table: CACHED_TABLE, ageMs: ONE_HOUR } },
+  )
 
   assert.deepEqual(costOf(result), { input: 1.11, output: 2.22 })
   assert.ok(
@@ -486,9 +523,9 @@ test('a fresh cache answers, without touching the network', async () => {
   // Asserted, not merely arranged: the throwing route above proves nothing on
   // its own, because a background refresh swallows whatever it throws.
   assert.deepEqual(
-    fetchedURLs.filter((u) => u.includes('models.dev')),
+    fetchedURLs.filter((u) => u.includes(DEFAULT_PRICE_TABLE_PATHNAME)),
     [],
-    'a fresh cache must not reach models.dev at all',
+    'a fresh cache must not reach the price table at all',
   )
 })
 
@@ -499,7 +536,7 @@ test('a stale cache still answers immediately, refreshing behind it', async () =
   const { result, logs } = await runConfigHook(
     providerConfig('https://proxy-stale.test'),
     PROXY_ROUTES,
-    { seed: { providers: CACHED_TABLE, ageMs: EIGHT_DAYS } },
+    { seed: { table: CACHED_TABLE, ageMs: EIGHT_DAYS } },
   )
 
   assert.deepEqual(costOf(result), { input: 1.11, output: 2.22 })
@@ -510,11 +547,11 @@ test('a stale cache still answers immediately, refreshing behind it', async () =
 })
 
 test('a cache written by an older schema is discarded, not half-read', async () => {
-  // The cache holds a TRIMMED table, so its layout is tied to
-  // PREFERRED_PROVIDERS and to the fields toCatalogFields reads. Serving an old
-  // layout would quietly price nothing from a newly added provider.
+  // The cache holds a TRIMMED table, so its layout is tied to the fields
+  // toCatalogFields and buildCost read. Serving an old layout would quietly
+  // price nothing from a newly read field.
   const { logs } = await runConfigHook(providerConfig('https://proxy-schema.test'), PROXY_ROUTES, {
-    seed: { providers: CACHED_TABLE, ageMs: ONE_HOUR, v: 0 },
+    seed: { table: CACHED_TABLE, ageMs: ONE_HOUR, v: 0 },
   })
 
   // Asserting on the SOURCE, not on "it was priced": the snapshot would price
@@ -529,20 +566,17 @@ test('a cache written by an older schema is discarded, not half-read', async () 
   )
 })
 
-test('prices from models.dev, including the model parameters', async () => {
+test('prices from the fetched price table, including the model parameters', async () => {
   const baseURL = 'https://proxy-source.test'
-  // The price table is served in models.dev's own published shape — flat
-  // capabilities and cache costs — which is not the shape opencode's provider
-  // list uses. Both must parse, or a price silently disappears.
   // With a snapshot in hand the fetch is never reached, so blank it: otherwise
   // this scenario silently asserts against the shipped snapshot instead of the
-  // served table, and `/api.json` below is never requested at all.
+  // served table, and the price-table route below is never requested at all.
   const { result } = await runConfigHook(
     providerConfig(baseURL),
     {
       '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
       '/model_group/info': () => json({ data: [] }),
-      '/api.json': () => json(MODELS_DEV_TABLE),
+      [DEFAULT_PRICE_TABLE_PATHNAME]: () => json(PRICE_TABLE),
     },
     { noSnapshot: true },
   )
@@ -558,14 +592,14 @@ test('prices from models.dev, including the model parameters', async () => {
     context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
   })
   // Context size and the other model parameters ride along on the same match.
-  assert.deepEqual(entry.limit, { context: 1050000, output: 128000 })
+  assert.deepEqual(entry.limit, { context: 922000, output: 128000 })
   assert.equal(entry.tool_call, true)
   assert.equal(entry.reasoning, true)
   assert.equal(entry.attachment, true)
   assert.deepEqual(entry.modalities, { input: ['text', 'image', 'pdf'], output: ['text'] })
 })
 
-test('a models.dev outage costs nothing: the shipped snapshot prices anyway', async () => {
+test('a price-table outage costs nothing: the shipped snapshot prices anyway', async () => {
   const baseURL = 'https://proxy-outage.test'
   // On a fresh install with no cache, this used to be the 10s stall that then
   // priced nothing. The snapshot makes it a non-event.
@@ -577,11 +611,11 @@ test('a models.dev outage costs nothing: the shipped snapshot prices anyway', as
     providerConfig(baseURL),
     {
       ...PROXY_ROUTES,
-      '/api.json': () => {
+      [DEFAULT_PRICE_TABLE_PATHNAME]: () => {
         throw new Error('network down')
       },
     },
-    { snapshot: MODELS_DEV_TABLE },
+    { snapshot: PRICE_TABLE },
   )
 
   assert.deepEqual(costOf(result), {
@@ -596,6 +630,105 @@ test('a models.dev outage costs nothing: the shipped snapshot prices anyway', as
   )
   // Nothing is wrong here, so nothing may warn.
   assert.equal(warns.length, 0, `expected no warnings, got: ${warns.join(' | ')}`)
+})
+
+// --- options.pricingURL -----------------------------------------------------
+//
+// The whole point of the option: a proxy operator serves an enriched copy of
+// LiteLLM's table, carrying their own gateway model names, and those price by
+// exact key instead of by substring against the public model line.
+
+const CUSTOM_PRICING_URL = 'https://catalog.example.com/model_prices_and_context_window.json'
+const CUSTOM_PRICING_PATHNAME = '/model_prices_and_context_window.json'
+
+/** An enriched table: the gateway's own model name, priced directly. */
+const ENRICHED_TABLE = {
+  'ai-gateway-gpt-5.4': {
+    litellm_provider: 'ai-gateway',
+    max_input_tokens: 400000,
+    max_output_tokens: 100000,
+    input_cost_per_token: 0.00000333,
+    output_cost_per_token: 0.00000444,
+  },
+}
+
+/** Read back what the plugin cached for `url` — the mirror of `seedCache`. */
+async function readCacheFile(url: string): Promise<{ table: Record<string, unknown> }> {
+  const key = createHash('sha256').update(url).digest('hex').slice(0, 12)
+  const file = join(
+    process.env.XDG_CACHE_HOME!,
+    'opencode-plugin-litellm-pricing',
+    `price-table-${key}.json`,
+  )
+  return JSON.parse(await readFile(file, 'utf8')) as { table: Record<string, unknown> }
+}
+
+test('options.pricingURL is fetched instead of the default table', async () => {
+  const { result, logs } = await runConfigHook(
+    providerConfig('https://proxy-custom.test', {
+      options: { baseURL: 'https://proxy-custom.test', apiKey: 'sk-test', pricingURL: CUSTOM_PRICING_URL },
+    }),
+    {
+      ...PROXY_ROUTES,
+      [CUSTOM_PRICING_PATHNAME]: () => json(ENRICHED_TABLE),
+      // The default table must not be consulted at all once a URL is set.
+      [DEFAULT_PRICE_TABLE_PATHNAME]: () => {
+        throw new Error('the default table must not be fetched when pricingURL is set')
+      },
+    },
+    // No snapshot, so the configured URL is the only thing that can answer.
+    { noSnapshot: true },
+  )
+
+  // The exact key wins: $3.33/$4.44, not whatever gpt-5.4 costs upstream.
+  assert.deepEqual(costOf(result), { input: 3.33, output: 4.44 })
+
+  // And it survives the round-trip through the cache. `trim` must filter by
+  // FIELD only: a provider filter there (the shape the old models.dev table
+  // needed) would drop every enriched entry on the way to disk, and the next
+  // start would price nothing while every assertion above still passed.
+  const cached = await readCacheFile(CUSTOM_PRICING_URL)
+  assert.deepEqual(cached.table['ai-gateway-gpt-5.4'], {
+    litellm_provider: 'ai-gateway',
+    max_input_tokens: 400000,
+    max_output_tokens: 100000,
+    input_cost_per_token: 0.00000333,
+    output_cost_per_token: 0.00000444,
+  })
+  // The configured URL is named as the source, and — since this table carries
+  // no azure/openai entries — the log says the substring pass is inert rather
+  // than trailing off after "substring match via ". That is exactly the state
+  // a partial table puts a user in, and it explains their coverage gap.
+  assert.ok(
+    logs.some((l) => l.includes(CUSTOM_PRICING_URL) && l.includes('exact model names only')),
+    `expected the configured URL and an empty-provider note, got: ${logs.join(' | ')}`,
+  )
+  assert.deepEqual(
+    fetchedURLs.filter((u) => u.includes(DEFAULT_PRICE_TABLE_PATHNAME)),
+    [],
+    'the default table must not be fetched when pricingURL is set',
+  )
+})
+
+test('the cache is keyed per price-table URL', async () => {
+  // A cache seeded for the DEFAULT url must never answer for a provider
+  // configured with a different one — otherwise switching tables, or running
+  // two providers against two tables, silently serves the wrong prices.
+  const { result } = await runConfigHook(
+    providerConfig('https://proxy-cachekey.test', {
+      options: {
+        baseURL: 'https://proxy-cachekey.test',
+        apiKey: 'sk-test',
+        pricingURL: CUSTOM_PRICING_URL,
+      },
+    }),
+    { ...PROXY_ROUTES, [CUSTOM_PRICING_PATHNAME]: () => json(ENRICHED_TABLE) },
+    { seed: { table: CACHED_TABLE, ageMs: ONE_HOUR }, noSnapshot: true },
+  )
+
+  // $1.11/$2.22 is the other URL's cache. Seeing it here means the cache key
+  // ignored the URL.
+  assert.deepEqual(costOf(result), { input: 3.33, output: 4.44 })
 })
 
 test('an SDK without client.app.log does not lose every model', async () => {
@@ -615,7 +748,7 @@ test('an SDK without client.app.log does not lose every model', async () => {
         '/model_group/info': () => json({ data: [] }),
       },
       async () => {
-        const input = fakePluginInput(CATALOG_PROVIDERS)
+        const input = fakePluginInput([])
         delete (input.client as unknown as Record<string, unknown>).app
         const hooks = await plugin(input)
         await hooks.config?.(config as unknown as Config)

@@ -88,7 +88,8 @@ function buildTier(
  * `max_input_tokens`/`max_output_tokens`, and the `max_tokens` some pages show
  * is ambiguous there. Leaving it undefined keeps the
  * `max_output_tokens ?? max_tokens` fallback honest. Cost is not mapped
- * either — the group endpoint carries none, and pricing comes from models.dev.
+ * either — the group endpoint carries none, and pricing comes from the price
+ * table.
  *
  * `null` is normalised to `undefined` so the `??` chains in `enrichModel`
  * treat a missing value as missing.
@@ -176,7 +177,7 @@ export function toConfigModel(
  * id heuristic only when there isn't one.
  *
  * LiteLLM's limits and capability flags win where present; `fields` (matched
- * from the models.dev catalog) supply cost and fill the remaining gaps, and
+ * from the price-table catalog) supply cost and fill the remaining gaps, and
  * may be null when nothing matched — the model is still injected, just barer.
  */
 export function configModelFromCatalog(
