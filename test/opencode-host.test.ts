@@ -695,9 +695,13 @@ test('options.pricingURL is fetched instead of the default table', async () => {
     input_cost_per_token: 0.00000333,
     output_cost_per_token: 0.00000444,
   })
+  // The configured URL is named as the source, and — since this table carries
+  // no azure/openai entries — the log says the substring pass is inert rather
+  // than trailing off after "substring match via ". That is exactly the state
+  // a partial table puts a user in, and it explains their coverage gap.
   assert.ok(
-    logs.some((l) => l.includes(CUSTOM_PRICING_URL)),
-    `expected the configured URL named as source, got: ${logs.join(' | ')}`,
+    logs.some((l) => l.includes(CUSTOM_PRICING_URL) && l.includes('exact model names only')),
+    `expected the configured URL and an empty-provider note, got: ${logs.join(' | ')}`,
   )
   assert.deepEqual(
     fetchedURLs.filter((u) => u.includes(DEFAULT_PRICE_TABLE_PATHNAME)),
