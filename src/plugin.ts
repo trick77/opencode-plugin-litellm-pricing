@@ -182,10 +182,24 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
         const apiKey = resolveApiKey(configuredKey)
         const customHeaders = readCustomHeaders(options)
 
-        // The price table this provider prices from. Awaiting it is safe — the
-        // load answers from the on-disk cache or the shipped snapshot and only
-        // ever refreshes in the background (see catalog.ts) — and it has to be
-        // awaited, because the hook runs once and there is no second pass.
+        // The configured URL is the only URL. Nothing is guessed, nothing is
+        // probed locally.
+        if (!configuredBase) {
+          report(
+            'warn',
+            `[litellm-pricing] provider "${providerId}" has no options.baseURL — set it to your LiteLLM URL; nothing was injected.`,
+          )
+          continue
+        }
+        const baseURL = normalizeBaseURL(configuredBase)
+
+        // The price table this provider prices from, loaded only once the
+        // provider is known to be usable: a provider with no baseURL injects
+        // nothing, so loading (and reporting on) a table for it is pure noise.
+        // Awaiting it is safe — the load answers from the on-disk cache or the
+        // shipped snapshot and only ever refreshes in the background (see
+        // catalog.ts) — and it has to be awaited, because the hook runs once
+        // and there is no second pass.
         const pricingURL =
           typeof options.pricingURL === 'string' && options.pricingURL
             ? options.pricingURL
@@ -208,12 +222,14 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
             // Name the providers the substring pass can draw on — or say it is
             // inert, which is what a table carrying neither azure nor openai
             // entries means: only exact model names will price.
-            const providers = status.matchedProviders ?? []
+            // Named `substringProviders`, not `providers`: the enclosing
+            // scope already has a `providers` — the config's provider map.
+            const substringProviders = status.matchedProviders ?? []
             report(
               'info',
               `[litellm-pricing] catalog: ${status.candidateCount} model(s) from ${status.source} — ` +
-                (providers.length > 0
-                  ? `substring match via ${providers.join(', ')}`
+                (substringProviders.length > 0
+                  ? `substring match via ${substringProviders.join(', ')}`
                   : 'exact model names only (no azure/openai entries to match by substring)'),
             )
           } else {
@@ -224,17 +240,6 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
             )
           }
         }
-
-        // The configured URL is the only URL. Nothing is guessed, nothing is
-        // probed locally.
-        if (!configuredBase) {
-          report(
-            'warn',
-            `[litellm-pricing] provider "${providerId}" has no options.baseURL — set it to your LiteLLM URL; nothing was injected.`,
-          )
-          continue
-        }
-        const baseURL = normalizeBaseURL(configuredBase)
 
         // Ensure the provider entry exists and is minimally wired.
         if (!providers[providerId]) providers[providerId] = provider

@@ -82,6 +82,10 @@ then `cd test/probe && opencode models`.
   entry, costs per TOKEN. Skip the `sample_spec` key — it is a doc stub.
 - Emit `cost` only when both `input` and `output` are known. Keep a real `0`
   (free tier); drop only absent values.
+- EXCEPTION, table path only (`toCatalogFields`): a cost that is zero across
+  the board is the table saying "no number", not "free" — upstream ships 124
+  such entries, some plainly billable. Drop the whole `cost`; the model is
+  injected unpriced and named in the log. Do NOT move this into `buildCost`.
 - Tiering: map LiteLLM `*_above_200k_tokens` → `context_over_200k`. Do NOT map
   `*_above_272k_tokens` (would overcharge the 200k–272k band).
 

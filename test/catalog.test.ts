@@ -105,7 +105,35 @@ test('an exact key matches case-insensitively', () => {
 test('an exact key works for providers outside the substring allow-list', () => {
   // `someaggregator` contributes no substring candidates, but its entry is
   // still the right answer when the proxy reports exactly that name.
-  assert.deepEqual(catalog.resolve('someaggregator/gpt-5.4')?.cost, { input: 0, output: 0 })
+  assert.equal(catalog.resolve('someaggregator/gpt-5.4')?.limit?.context, 1)
+})
+
+test('an all-zero table cost is dropped, not shown as free', () => {
+  // Upstream carries 124 entries priced 0/0, several of them plainly billable
+  // chat models. Exact-key matching reaches them now, and reporting a billable
+  // model as free is the failure this plugin exists to prevent — so it is
+  // injected unpriced and named in the log instead.
+  assert.equal(catalog.resolve('someaggregator/gpt-5.4')?.cost, undefined)
+  // A zero that is part of a real price (a free cache tier) still survives.
+  const partial = buildFromTable({
+    'azure/free-input': {
+      litellm_provider: 'azure',
+      input_cost_per_token: 0,
+      output_cost_per_token: 0.000002,
+    },
+  }).resolve('azure/free-input')
+  assert.deepEqual(partial?.cost, { input: 0, output: 2 })
+})
+
+test('an exact key carrying nothing does not swallow the substring pass', () => {
+  // `trim()` keeps any entry with one known field, so an enriched entry whose
+  // cost keys are mistyped survives to disk as `{litellm_provider}` alone. It
+  // must not count as the answer — the substring pass can still price it.
+  const fields = buildFromTable({
+    ...TABLE,
+    'ai-gateway-gpt-5.4': { litellm_provider: 'ai-gateway' },
+  }).resolve('ai-gateway-gpt-5.4')
+  assert.equal(fields?.cost?.input, 2.5, 'should fall through to azure/gpt-5.4')
 })
 
 test('longest match wins: …gpt-5.4-mini resolves to mini, not the base', () => {

@@ -137,7 +137,10 @@ deliberately not mapped — forcing it into the 200k bucket would overcharge
 everything between 200k and 272k.
 
 If no catalog match is found, the `cost` block is **omitted** rather than shown
-wrong. Existing entries you've hand-curated under `provider.*.models` are never
+wrong. The same goes for a match whose price is zero across the board: LiteLLM's
+table carries entries priced `0/0` that are plainly billable models, so a
+blanket zero is read as "no number" and the model is listed as unpriced instead
+of as free. Existing entries you've hand-curated under `provider.*.models` are never
 overwritten. Wildcard (`*`) entries are skipped — they are access rules, not
 callable models.
 

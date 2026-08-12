@@ -141,16 +141,29 @@ export function getCatalog(url: string): Promise<Catalog | null> {
 
   const entry: Load = { promise: Promise.resolve(null), status: { state: 'loading' } }
   loads.set(url, entry)
-  entry.promise = load(url).then((result) => {
-    entry.status = result.status
-    return result.catalog
-  })
+  entry.promise = load(url).then(
+    (result) => {
+      entry.status = result.status
+      return result.catalog
+    },
+    (err: unknown) => {
+      // load() is written not to reject, but the `config` hook awaits this
+      // promise and must never throw out of it. Record the failure as a real
+      // verdict too, or the caller's report reads "unavailable (undefined)".
+      entry.status = {
+        state: 'unavailable',
+        source: url,
+        reason: err instanceof Error ? err.message : String(err),
+      }
+      return null
+    },
+  )
   return entry.promise
 }
 
 /** Clear the memoized catalogs — used by tests. */
 export function resetCatalogCache(): void {
-  pendingRefresh = undefined
+  pendingRefreshes.length = 0
   loads.clear()
 }
 
@@ -313,8 +326,8 @@ async function fetchTable(url: string): Promise<Record<string, Record<string, un
   return table
 }
 
-/** The in-flight background refresh, if any — see settleRefreshForTests. */
-let pendingRefresh: Promise<unknown> | undefined
+/** The in-flight background refreshes — see settleRefreshForTests. */
+const pendingRefreshes: Array<Promise<unknown>> = []
 
 /**
  * Refresh for the NEXT launch, without anybody waiting for it.
@@ -329,11 +342,11 @@ let pendingRefresh: Promise<unknown> | undefined
  * unhandled rejection would take the process down.
  */
 function refreshInBackground(url: string): void {
-  pendingRefresh = fetchTable(url).catch(() => {})
+  pendingRefreshes.push(fetchTable(url).catch(() => {}))
 }
 
 /**
- * Await whatever background refresh the last load started — used by tests.
+ * Await every background refresh the loads started — used by tests.
  *
  * The refresh resolves `cachePath()` when it *writes*, not when it starts, and
  * the suite swaps `XDG_CACHE_HOME` per scenario. A refresh still in flight when
@@ -342,7 +355,10 @@ function refreshInBackground(url: string): void {
  * Settling it at the end of each scenario is what keeps the branches isolated.
  */
 export async function settleRefreshForTests(): Promise<void> {
-  await pendingRefresh
+  // Every refresh, not just the last one: two providers on two price-table
+  // URLs each start one, and a straggler is exactly what writes into the next
+  // scenario's cache directory.
+  while (pendingRefreshes.length > 0) await Promise.all(pendingRefreshes.splice(0))
 }
 
 /**
@@ -467,7 +483,12 @@ export function buildFromTable(table: Record<string, unknown>): Catalog {
     resolve(litellmModelName: string): CatalogFields | null {
       const norm = litellmModelName.toLowerCase()
       const direct = exact.get(norm)
-      if (direct) return direct
+      // An exact key wins outright — but only when the entry actually carries
+      // something. `trim()` keeps any entry with one known field, so an
+      // enriched table whose entry has `litellm_provider` and mistyped cost
+      // keys reaches here as {}; returning it would swallow the substring pass
+      // that could still have priced the model.
+      if (direct && Object.keys(direct).length > 0) return direct
       for (const c of candidates) {
         if (isBoundedSubstring(norm, c.id)) return c.fields
       }
@@ -527,7 +548,7 @@ export function toCatalogFields(entry: Record<string, unknown>): CatalogFields {
   const fields: CatalogFields = {}
 
   const cost = buildCost(entry as LiteLLMModelInfo)
-  if (cost) fields.cost = cost
+  if (cost && !isAllZero(cost)) fields.cost = cost
 
   // LiteLLM semantics: max_input_tokens = context window; max_output_tokens =
   // max completion, with max_tokens as its legacy alias (NOT total context).
@@ -546,4 +567,33 @@ export function toCatalogFields(entry: Record<string, unknown>): CatalogFields {
   if (input.length > 1) fields.modalities = { input, output: ['text'] }
 
   return fields
+}
+
+/**
+ * A cost of exactly zero across the board, which the table means as "we have
+ * no number for this" — not as "this model is free".
+ *
+ * LiteLLM's published table carries 124 such entries, and several are plainly
+ * billable chat models (`deepseek-v3-2-251201`, `codestral/codestral-latest`,
+ * `anthropic.claude-mythos-preview`). Under the old models.dev source they
+ * could not be reached; exact-key matching reaches them, and emitting
+ * `{input: 0, output: 0}` would display a billable model as free — the precise
+ * failure this plugin exists to prevent, and worse than showing nothing.
+ *
+ * So the model is injected UNPRICED and named in the startup log's "no
+ * pricing" list, where it can be seen and reported upstream. A genuinely free
+ * model loses its `$0` display; that is the cheap side of this trade.
+ *
+ * Deliberately not done inside `buildCost` — its contract keeps a real 0 for a
+ * free tier, which is right for a per-deployment reading. It is the TABLE's
+ * zeroes that are unreliable.
+ */
+function isAllZero(cost: CostBlock): boolean {
+  return (
+    cost.input === 0 &&
+    cost.output === 0 &&
+    !cost.cache_read &&
+    !cost.cache_write &&
+    !cost.context_over_200k
+  )
 }
