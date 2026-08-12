@@ -12,6 +12,7 @@
 // passed the broken build. So `loadPlugins` below reproduces the loader
 // rule instead of approximating it.
 
+import { createHash } from 'node:crypto'
 import { mkdir, utimes, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Plugin, PluginInput } from '@opencode-ai/plugin'
@@ -71,33 +72,36 @@ export function loadPlugins(mod: object): Plugin[] {
 // --- the plugin input -----------------------------------------------------
 
 /**
- * The price table as models.dev actually publishes it: an object keyed by
- * provider id, with capabilities and cache costs FLAT (`tool_call`,
- * `cost.cache_read`, `modalities.input` as a string array). opencode's own
- * provider list nests the same information, so the two fixtures together prove
- * `toCatalogFields` reads both.
+ * A price table in LiteLLM's `model_prices_and_context_window.json` format:
+ * one flat object keyed by model name, costs stated in USD per TOKEN, and the
+ * provider carried inside each entry as `litellm_provider`.
  */
-export const MODELS_DEV_TABLE = {
-  azure: {
-    id: 'azure',
-    models: {
-      'gpt-5.4': {
-        id: 'gpt-5.4',
-        cost: {
-          input: 2.5,
-          output: 15,
-          cache_read: 0.25,
-          tiers: [{ input: 5, output: 22.5, cache_read: 0.5, tier: { type: 'context', size: 272000 } }],
-        },
-        limit: { context: 1050000, input: 922000, output: 128000 },
-        reasoning: true,
-        tool_call: true,
-        attachment: true,
-        modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      },
-    },
+export const PRICE_TABLE = {
+  sample_spec: {
+    litellm_provider: 'one of the providers',
+    input_cost_per_token: 0.0,
+    output_cost_per_token: 0.0,
+  },
+  'azure/gpt-5.4': {
+    litellm_provider: 'azure',
+    max_input_tokens: 922000,
+    max_output_tokens: 128000,
+    max_tokens: 128000,
+    input_cost_per_token: 0.0000025,
+    output_cost_per_token: 0.000015,
+    cache_read_input_token_cost: 0.00000025,
+    input_cost_per_token_above_200k_tokens: 0.000005,
+    output_cost_per_token_above_200k_tokens: 0.0000225,
+    cache_read_input_token_cost_above_200k_tokens: 0.0000005,
+    supports_function_calling: true,
+    supports_reasoning: true,
+    supports_vision: true,
+    supports_pdf_input: true,
   },
 }
+
+/** The URL the plugin fetches when no `pricingURL` is configured. */
+export const DEFAULT_PRICE_TABLE_PATHNAME = '/BerriAI/litellm/main/model_prices_and_context_window.json'
 
 /**
  * Write a cache file the plugin will find, aged as asked.
@@ -105,14 +109,21 @@ export const MODELS_DEV_TABLE = {
  * `load()` picks its source by cache age, so a scenario that means to exercise
  * the fresh- or stale-cache branch has to put one there — otherwise it silently
  * falls through to the shipped snapshot and asserts nothing about caching.
- * Mirrors the envelope written by `writeCache` in src/catalog.ts; keep `v` in
- * step with CACHE_SCHEMA.
+ * Mirrors the envelope written by `writeCache` in src/catalog.ts — including
+ * the URL-derived filename, since the cache is keyed per price-table URL; keep
+ * `v` in step with CACHE_SCHEMA.
  */
-export async function seedCache(providers: unknown[], ageMs: number, v = 1): Promise<void> {
+export async function seedCache(
+  url: string,
+  table: unknown,
+  ageMs: number,
+  v = 2,
+): Promise<void> {
   const dir = join(process.env.XDG_CACHE_HOME!, 'opencode-plugin-litellm-pricing')
   await mkdir(dir, { recursive: true })
-  const file = join(dir, 'models-dev.json')
-  await writeFile(file, JSON.stringify({ v, providers }), 'utf8')
+  const key = createHash('sha256').update(url).digest('hex').slice(0, 12)
+  const file = join(dir, `price-table-${key}.json`)
+  await writeFile(file, JSON.stringify({ v, url, table }), 'utf8')
   const when = new Date(Date.now() - ageMs)
   await utimes(file, when, when)
 }
@@ -167,30 +178,6 @@ export function fakePluginInput(
   } as unknown as PluginInput
 }
 
-/**
- * A models.dev-shaped catalog slice, matching the fixture already proven
- * against `buildFromProviders` in catalog.test.ts. `gpt-5.4` is the model the
- * scenarios price against.
- */
-export const CATALOG_PROVIDERS = [
-  {
-    id: 'azure',
-    models: {
-      'gpt-5.4': {
-        id: 'gpt-5.4',
-        cost: { input: 2.5, output: 15, cache: { read: 0.25, write: 0 } },
-        limit: { context: 1050000, output: 128000 },
-        capabilities: {
-          reasoning: true,
-          toolcall: true,
-          attachment: true,
-          input: { text: true, image: true, audio: false, video: false, pdf: true },
-        },
-      },
-    },
-  },
-]
-
 // --- the proxy ------------------------------------------------------------
 
 /** A route handler: return a Response, or throw to simulate an unreachable proxy. */
@@ -226,14 +213,15 @@ export async function withFakeProxy<T>(routes: Routes, fn: () => Promise<T>): Pr
   const stub = async (input: unknown): Promise<Response> => {
     const url = new URL(String(input))
     fetchedURLs.push(url.href)
-    // The price table is fetched from models.dev, not from the proxy — see
+    // The price table is fetched from its own URL, not from the proxy — see
     // load() in src/catalog.ts. Scenarios that don't care get the default
     // table; one that does can override the route.
-    const route = routes[url.pathname] ?? (url.host === 'models.dev' ? modelsDev : undefined)
+    const route =
+      routes[url.pathname] ?? (url.pathname === DEFAULT_PRICE_TABLE_PATHNAME ? priceTable : undefined)
     if (!route) throw new Error(`fake proxy: no route for ${url.pathname}`)
     return route()
   }
-  const modelsDev = () => json(MODELS_DEV_TABLE)
+  const priceTable = () => json(PRICE_TABLE)
   globalThis.fetch = stub as unknown as typeof globalThis.fetch
   try {
     return await fn()

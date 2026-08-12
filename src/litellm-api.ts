@@ -125,7 +125,7 @@ export async function discoverLiteLLMModels(
  * Preferred over /v1/model/info because `model_group` IS the `model_name` that
  * /v1/models reports, so no alias resolution is needed. The response DOES
  * carry per-token cost fields; they are deliberately not read. Pricing comes
- * from the models.dev catalog alone, by policy: LiteLLM's numbers are only
+ * from the price-table catalog alone, by policy: LiteLLM's numbers are only
  * right when the deployment sets `model_info.base_model`, and getting that
  * wrong silently bills $0.
  *

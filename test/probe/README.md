@@ -37,6 +37,6 @@ rm -rf ~/.cache/opencode-plugin-litellm-pricing
   cannot answer a request while a plugin blocks on it: awaiting
   `config.providers` / `provider.list` timed out at 60 s, while the identical
   unawaited call returned in 351 ms — after the hook had already run. This is
-  why the price table is fetched from models.dev instead.
+  why the price table is fetched over plain HTTPS instead.
 - **Prices reaching the log is not the same as prices reaching the picker.**
   Assert against `/config/providers`, not against stdout.

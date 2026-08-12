@@ -101,7 +101,7 @@ export interface LiteLLMModelInfoResponse {
  * is the plugin's source for `mode` (what kind of model it is) and for the
  * capability flags. The endpoint also returns per-token cost fields; they are
  * deliberately not declared here and never read — pricing comes from the
- * models.dev catalog by policy, because LiteLLM's own numbers silently become
+ * price-table catalog by policy, because LiteLLM's own numbers silently become
  * $0 when a deployment's `base_model` is misconfigured.
  *
  * `mode` may legitimately be `null` — LiteLLM emits that for models it has no
