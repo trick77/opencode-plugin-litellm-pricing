@@ -93,14 +93,12 @@ The table is cached under `$XDG_CACHE_HOME/opencode-plugin-litellm-pricing/`
 | --- | --- |
 | `cache` | the cached copy is less than 7 days old — no network at all |
 | `stale cache (refreshing)` | it is older than 7 days: served anyway, with a refresh in the background |
-| the price-table URL | no cache yet, so the table is fetched before the picker is built (3-second limit) |
+| the price-table URL | no usable cache, so the table is fetched before the picker is built (3-second limit) |
 
-The startup log names which one answered. Only the first start after install
-waits on that fetch. No price table ships in the package: it would be stale
-before you installed it, and OpenCode calls the plugin's `config` hook exactly
-once, before anything is displayed, so there is no later pass that could correct
-prices injected from a stale copy. If the fetch fails, models are injected
-without a `cost` block and the log says so.
+The startup log names which one answered. No price table ships in the package,
+so a start with no usable cache — a fresh install, a cleared cache, an upgrade
+that changes the cache format — fetches one. If that fetch fails, models are
+injected without a `cost` block and the log says so.
 
 ## Non-chat models
 
