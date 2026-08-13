@@ -222,25 +222,3 @@ test('max_tokens stands in for a missing max_output_tokens', () => {
   }).resolve('azure/legacy')!
   assert.deepEqual(fields.limit, { context: 128000, output: 4096 })
 })
-
-// --- the shipped snapshot ---------------------------------------------------
-
-test('the shipped snapshot round-trips into a usable catalog', async () => {
-  // A snapshot in the wrong shape parses fine, builds an EMPTY catalog, and
-  // quietly puts a blocking fetch back on every fresh install — so assert the
-  // count, not just that it loaded.
-  const { PRICE_TABLE_SNAPSHOT } = await import('../src/price-table-snapshot.ts')
-  const snapshot = buildFromTable(PRICE_TABLE_SNAPSHOT as Record<string, unknown>)
-
-  assert.ok(snapshot.candidateCount > 100, `snapshot has only ${snapshot.candidateCount} models`)
-  assert.deepEqual([...snapshot.matchedProviders], ['azure', 'openai'])
-  // Structural, never a pinned price: the snapshot is REGENERATED before every
-  // release, so asserting upstream's current numbers here would turn a routine
-  // `npm run update-snapshot` into a failing suite at tag time. Exact values
-  // are pinned against fixtures above and in the host tests.
-  const priced = snapshot.resolve('ai-gateway-gpt-4o')
-  assert.ok(priced, 'the snapshot must price a gateway-prefixed model')
-  assert.ok((priced.limit?.context ?? 0) > 0, 'a matched model must carry a context limit')
-  assert.ok((priced.cost?.input ?? 0) > 0, 'a matched model must carry an input price')
-  assert.ok((priced.cost?.output ?? 0) > 0, 'a matched model must carry an output price')
-})

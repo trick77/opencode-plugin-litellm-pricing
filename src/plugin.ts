@@ -196,10 +196,10 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
         // The price table this provider prices from, loaded only once the
         // provider is known to be usable: a provider with no baseURL injects
         // nothing, so loading (and reporting on) a table for it is pure noise.
-        // Awaiting it is safe — the load answers from the on-disk cache or the
-        // shipped snapshot and only ever refreshes in the background (see
-        // catalog.ts) — and it has to be awaited, because the hook runs once
-        // and there is no second pass.
+        // Awaiting it is what the hook running exactly once forces: there is
+        // no second pass to price into. After the first start it costs nothing
+        // — the load answers from the on-disk cache and refreshes in the
+        // background (see catalog.ts).
         const pricingURL =
           typeof options.pricingURL === 'string' && options.pricingURL
             ? options.pricingURL
@@ -215,9 +215,8 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           const status = getCatalogStatus(pricingURL)
           // `ok` always carries a non-empty catalog — catalogFrom() returns null
           // at zero candidates, so a zero-candidate `ok` cannot be constructed.
-          // `snapshot (refreshing)` and `stale cache (refreshing)` are successes
-          // too, not degraded states, and must not warn: they are what keeps
-          // startup off the network.
+          // `stale cache (refreshing)` is a success too, not a degraded state,
+          // and must not warn: it is what keeps startup off the network.
           if (status.state === 'ok') {
             // Name the providers the substring pass can draw on — or say it is
             // inert, which is what a table carrying neither azure nor openai
