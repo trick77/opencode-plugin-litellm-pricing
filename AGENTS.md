@@ -51,30 +51,29 @@ then `cd test/probe && opencode models`.
 - ONE cost source: the configured price table, in LiteLLM
   `model_prices_and_context_window.json` format (`options.pricingURL`, default
   = LiteLLM's published file). Costs are per-TOKEN — they MUST go through
-  `buildCost`/`perMillion` (×1e6). Never source cost from the proxy
-  (base_model misconfig silently bills $0).
-- NEVER await a fetch on the startup path. The `config` hook runs once, before
-  anything renders, so a fetch there is a stall the user sits through. `load()`
-  answers from cache (7d) → stale cache → shipped snapshot, each demoting the
-  fetch to a background refresh. Background refresh must `.catch()` — nothing
+  `buildCost`/`perMillion` (×1e6). Never source cost from the proxy —
+  `/v1/model/info` needs an admin key, which a normal virtual key is not.
+- NEVER await a fetch on the startup path once a cache exists. The `config`
+  hook runs once, before anything renders, so a fetch there is a stall the user
+  sits through. `load()` answers from cache (7d) → stale cache (background
+  refresh) → fetch. That last branch is the FIRST start only: nothing ships in
+  the package, and the hook has no second pass, so an unpriced injection there
+  stays unpriced all session. Background refresh must `.catch()` — nothing
   observes it, and an unhandled rejection kills the process. Safe to leave
   pending: opencode exits without draining the event loop (measured: CLI exited
   216ms in with a black-holed 3s fetch outstanding), so it lands in long
   sessions and is simply skipped in short ones.
-- `src/price-table-snapshot.ts` is GENERATED — `npm run update-snapshot`, never
-  hand-edit. Keep `KEEP_FIELDS` and the URL in `scripts/update-snapshot.mjs` in
-  step with `catalog.ts` — the script CANNOT import them, `catalog.ts` imports
-  the snapshot it generates. Bump `CACHE_SCHEMA` when the trimmed shape changes
-  or old caches are served as if complete.
+- NEVER ship a price table in the package. It goes stale between releases and
+  bloats the install; the cache is the only local copy. Bump `CACHE_SCHEMA`
+  when `KEEP_FIELDS` changes, else old caches are served as if complete.
 - The cache file is keyed by a hash of the price-table URL. Two providers on
   two tables must never read each other's prices.
 - NEVER filter the table by provider when trimming/caching. Only the SUBSTRING
   pass is restricted to `azure`/`openai`; the exact-key pass sees everything,
   and a provider filter would strip out precisely the enriched entries a custom
   table exists to provide.
-- NEVER pin an upstream price against the real snapshot in a test — it is
-  regenerated before every release, so `npm run update-snapshot` would fail the
-  suite at tag time. Pass a fixture via the harness `snapshot` option instead.
+- Pin prices against fixtures only (`PRICE_TABLE`), seeded via the harness
+  `seed` option or served by the fake proxy — never against live upstream data.
 - NEVER go back to `client.config.providers()` for cost: deadlocks (above), and
   lists only the reader's configured providers — no Azure creds → no `azure`,
   and its `openai` entry reports every cost as 0 → real models priced $0.
@@ -125,8 +124,6 @@ then `cd test/probe && opencode models`.
 
 ## Release
 
-- Run `npm run update-snapshot` BEFORE tagging, else the release ships a price
-  table older than itself.
 - Tag-driven. Bump `version` in `package.json`, push `vX.Y.Z` (must match). CI
   publishes to npm via OIDC trusted publishing. Do not `npm publish` by hand.
 - Tag on `master` AFTER merge — the workflow publishes whatever commit the tag

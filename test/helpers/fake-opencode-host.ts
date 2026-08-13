@@ -108,7 +108,7 @@ export const DEFAULT_PRICE_TABLE_PATHNAME = '/BerriAI/litellm/main/model_prices_
  *
  * `load()` picks its source by cache age, so a scenario that means to exercise
  * the fresh- or stale-cache branch has to put one there — otherwise it silently
- * falls through to the shipped snapshot and asserts nothing about caching.
+ * falls through to the live fetch and asserts nothing about caching.
  * Mirrors the envelope written by `writeCache` in src/catalog.ts — including
  * the URL-derived filename, since the cache is keyed per price-table URL; keep
  * `v` in step with CACHE_SCHEMA.

@@ -18,10 +18,8 @@ import type { Config } from '@opencode-ai/plugin'
 import {
   DEFAULT_PRICE_TABLE_URL,
   resetCatalogCache,
-  setSnapshotForTests,
   settleRefreshForTests,
 } from '../src/catalog.ts'
-import { PRICE_TABLE_SNAPSHOT } from '../src/price-table-snapshot.ts'
 import { resetReportedCatalog } from '../src/plugin.ts'
 import {
   DEFAULT_PRICE_TABLE_PATHNAME,
@@ -59,15 +57,6 @@ async function runConfigHook(
      * scenario's provider will actually resolve — the default otherwise.
      */
     seed?: { url?: string; table: unknown; ageMs: number; v?: number }
-    /** Blank the shipped snapshot, to reach the no-table-at-all path. */
-    noSnapshot?: boolean
-    /**
-     * Stand in for the shipped snapshot. Prefer this over the real file
-     * wherever exact prices are asserted: the real one is REGENERATED before
-     * every release, so pinning upstream numbers through it turns a routine
-     * `npm run update-snapshot` into a red suite at tag time.
-     */
-    snapshot?: unknown
   } = {},
 ) {
   resetCatalogCache()
@@ -76,7 +65,6 @@ async function runConfigHook(
   // so the suite can neither read the developer's cache nor write to it —
   // otherwise these scenarios pass or fail depending on the host machine.
   process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), 'litellm-pricing-test-'))
-  setSnapshotForTests(opts.noSnapshot ? {} : (opts.snapshot ?? PRICE_TABLE_SNAPSHOT))
   if (opts.seed) {
     await seedCache(
       opts.seed.url ?? DEFAULT_PRICE_TABLE_URL,
@@ -102,13 +90,16 @@ async function runConfigHook(
   )
   // Settle any background refresh before the next scenario swaps
   // XDG_CACHE_HOME out from under it — otherwise its cache write lands in the
-  // NEXT scenario's directory and quietly turns a snapshot branch into a
+  // NEXT scenario's directory and quietly turns a no-table branch into a
   // cache hit.
   await settleRefreshForTests()
   return captured
 }
 
 const PROVIDER_KEY = 'opencode-plugin-litellm-pricing'
+
+const ONE_HOUR = 60 * 60 * 1000
+const EIGHT_DAYS = 8 * 24 * ONE_HOUR
 
 /** A provider block shaped like the one the README tells users to write. */
 function providerConfig(baseURL: string, extra: Record<string, unknown> = {}) {
@@ -170,10 +161,9 @@ test('injects discovered models with catalog pricing into the config', async () 
           ],
         }),
     },
-    // Priced against the fixture, not the shipped snapshot: the real one is
-    // regenerated before every release, so pinning upstream's current numbers
-    // here would turn `npm run update-snapshot` into a red suite at tag time.
-    { snapshot: PRICE_TABLE },
+    // Priced from a seeded cache: nothing ships in the package, so the cache
+    // is the only thing that can price a start.
+    { seed: { table: PRICE_TABLE, ageMs: ONE_HOUR } },
   )
 
   const provider = config.provider[PROVIDER_KEY]!
@@ -241,7 +231,7 @@ test('the pre-rename provider id is still matched', async () => {
       '/model_group/info': () =>
         json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
     },
-    { snapshot: PRICE_TABLE },
+    { seed: { table: PRICE_TABLE, ageMs: ONE_HOUR } },
   )
 
   const models = config.provider['opencode-litellm-pricing']!.models as Record<
@@ -427,9 +417,9 @@ test('a failing app.log never breaks config loading', async () => {
 
 test('with no table at all, the failure is reported rather than shown as $0', async () => {
   const baseURL = 'https://proxy-nocatalog.test'
-  // Only reachable with the shipped snapshot blanked — which is the point of
-  // shipping it. Kept covered because this is the path that has to EXPLAIN a
-  // priceless startup, and an unexplained $0 is what started all of this.
+  // The fresh-install path: no cache, nothing shipped, and no fetch anybody
+  // waits on. It has to EXPLAIN a priceless startup — an unexplained $0 is
+  // what started all of this.
   const { logs, warns } = await runConfigHook(
     providerConfig(baseURL),
     {
@@ -438,7 +428,6 @@ test('with no table at all, the failure is reported rather than shown as $0', as
       // A table with nothing usable in it: parses, prices nothing.
       [DEFAULT_PRICE_TABLE_PATHNAME]: () => json({ sample_spec: { litellm_provider: 'none' } }),
     },
-    { noSnapshot: true },
   )
   const all = [...logs, ...warns]
 
@@ -455,29 +444,31 @@ test('with no table at all, the failure is reported rather than shown as $0', as
 
 test('a working catalog reports its size and source', async () => {
   const baseURL = 'https://proxy-catalogok.test'
-  const { logs } = await runConfigHook(providerConfig(baseURL), {
-    '/v1/models': () => json({ data: MIXED_MODELS }),
-    '/model_group/info': () => json({ data: [] }),
-  })
+  const { logs } = await runConfigHook(
+    providerConfig(baseURL),
+    {
+      '/v1/models': () => json({ data: MIXED_MODELS }),
+      '/model_group/info': () => json({ data: [] }),
+    },
+    { seed: { table: PRICE_TABLE, ageMs: ONE_HOUR } },
+  )
 
   // This line separates "no table loaded" from "table loaded, nothing matched"
-  // — the two causes of a clean zero — and now also names WHICH of the four
-  // sources answered, since that is what explains a slow or stale start.
+  // — the two causes of a clean zero — and names WHICH source answered, since
+  // that is what explains a stale start.
   assert.ok(
-    logs.some((l) => l.includes('catalog:') && l.includes('snapshot')),
-    `expected a catalog line naming the snapshot, got: ${logs.join(' | ')}`,
+    logs.some((l) => l.includes('catalog:') && l.includes('model(s) from cache')),
+    `expected a catalog line naming the source, got: ${logs.join(' | ')}`,
   )
 })
 
 // --- where the price table comes from ---------------------------------------
 //
-// load() answers from disk or from the shipped snapshot and never makes the
-// user wait on the network. Each branch is pinned by its source string: a
-// mis-wired cache still prices correctly (via the snapshot) while having
-// silently stopped caching, so asserting "it was priced" proves nothing.
-
-const ONE_HOUR = 60 * 60 * 1000
-const EIGHT_DAYS = 8 * 24 * ONE_HOUR
+// load() answers from the on-disk cache once there is one, and only the very
+// first start waits on the network. Each branch is pinned by its source
+// string: a mis-wired cache still prices correctly (by fetching every time)
+// while having silently stopped caching, so asserting "it was priced" proves
+// nothing.
 
 /** A cached table, in the trimmed flat shape writeCache stores. */
 const CACHED_TABLE = {
@@ -550,27 +541,26 @@ test('a cache written by an older schema is discarded, not half-read', async () 
   // The cache holds a TRIMMED table, so its layout is tied to the fields
   // toCatalogFields and buildCost read. Serving an old layout would quietly
   // price nothing from a newly read field.
-  const { logs } = await runConfigHook(providerConfig('https://proxy-schema.test'), PROXY_ROUTES, {
-    seed: { table: CACHED_TABLE, ageMs: ONE_HOUR, v: 0 },
-  })
+  const { logs } = await runConfigHook(
+    providerConfig('https://proxy-schema.test'),
+    { ...PROXY_ROUTES, [DEFAULT_PRICE_TABLE_PATHNAME]: () => json(PRICE_TABLE) },
+    { seed: { table: CACHED_TABLE, ageMs: ONE_HOUR, v: 0 } },
+  )
 
-  // Asserting on the SOURCE, not on "it was priced": the snapshot would price
-  // this correctly either way, hiding a cache that had stopped being read.
+  // Asserting on the SOURCE, not on "it was priced": the fetch prices this
+  // correctly either way, hiding a cache that had stopped being read.
   assert.ok(
-    logs.some((l) => l.includes('catalog:') && l.includes('snapshot')),
+    !logs.some((l) => l.includes('from cache')),
     `expected the stale-schema cache to be discarded, got: ${logs.join(' | ')}`,
   )
   assert.ok(
-    !logs.some((l) => l.includes('from cache')),
-    `expected no cache hit, got: ${logs.join(' | ')}`,
+    logs.some((l) => l.includes('catalog:') && l.includes(DEFAULT_PRICE_TABLE_URL)),
+    `expected the fetched table as source, got: ${logs.join(' | ')}`,
   )
 })
 
 test('prices from the fetched price table, including the model parameters', async () => {
   const baseURL = 'https://proxy-source.test'
-  // With a snapshot in hand the fetch is never reached, so blank it: otherwise
-  // this scenario silently asserts against the shipped snapshot instead of the
-  // served table, and the price-table route below is never requested at all.
   const { result } = await runConfigHook(
     providerConfig(baseURL),
     {
@@ -578,7 +568,6 @@ test('prices from the fetched price table, including the model parameters', asyn
       '/model_group/info': () => json({ data: [] }),
       [DEFAULT_PRICE_TABLE_PATHNAME]: () => json(PRICE_TABLE),
     },
-    { noSnapshot: true },
   )
 
   const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
@@ -599,14 +588,10 @@ test('prices from the fetched price table, including the model parameters', asyn
   assert.deepEqual(entry.modalities, { input: ['text', 'image', 'pdf'], output: ['text'] })
 })
 
-test('a price-table outage costs nothing: the shipped snapshot prices anyway', async () => {
+test('a price-table outage costs nothing once a cache exists', async () => {
   const baseURL = 'https://proxy-outage.test'
-  // On a fresh install with no cache, this used to be the 10s stall that then
-  // priced nothing. The snapshot makes it a non-event.
-  // The snapshot is supplied as a fixture rather than read from the shipped
-  // file: `npm run update-snapshot` runs before every release, so asserting
-  // upstream's current prices through the real snapshot would make a routine
-  // regeneration fail the suite.
+  // The outage that matters is the everyday one: a table on disk, however old,
+  // and no network. Week-old list prices beat both a stall and a $0.
   const { result, logs, warns } = await runConfigHook(
     providerConfig(baseURL),
     {
@@ -615,7 +600,7 @@ test('a price-table outage costs nothing: the shipped snapshot prices anyway', a
         throw new Error('network down')
       },
     },
-    { snapshot: PRICE_TABLE },
+    { seed: { table: PRICE_TABLE, ageMs: EIGHT_DAYS } },
   )
 
   assert.deepEqual(costOf(result), {
@@ -625,8 +610,8 @@ test('a price-table outage costs nothing: the shipped snapshot prices anyway', a
     context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
   })
   assert.ok(
-    logs.some((l) => l.includes('snapshot (refreshing)')),
-    `expected the snapshot source, got: ${logs.join(' | ')}`,
+    logs.some((l) => l.includes('stale cache (refreshing)')),
+    `expected the stale-cache source, got: ${logs.join(' | ')}`,
   )
   // Nothing is wrong here, so nothing may warn.
   assert.equal(warns.length, 0, `expected no warnings, got: ${warns.join(' | ')}`)
@@ -676,8 +661,6 @@ test('options.pricingURL is fetched instead of the default table', async () => {
         throw new Error('the default table must not be fetched when pricingURL is set')
       },
     },
-    // No snapshot, so the configured URL is the only thing that can answer.
-    { noSnapshot: true },
   )
 
   // The exact key wins: $3.33/$4.44, not whatever gpt-5.4 costs upstream.
@@ -723,7 +706,7 @@ test('the cache is keyed per price-table URL', async () => {
       },
     }),
     { ...PROXY_ROUTES, [CUSTOM_PRICING_PATHNAME]: () => json(ENRICHED_TABLE) },
-    { seed: { table: CACHED_TABLE, ageMs: ONE_HOUR }, noSnapshot: true },
+    { seed: { table: CACHED_TABLE, ageMs: ONE_HOUR } },
   )
 
   // $1.11/$2.22 is the other URL's cache. Seeing it here means the cache key

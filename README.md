@@ -84,20 +84,23 @@ since forcing it into the 200k bucket would overcharge everything in between.
 requires an admin key. Normal virtual keys get nothing back, so it is not usable
 as a pricing source.
 
-### Startup never waits on the network
+### The cache
 
-The `config` hook runs once, before anything is displayed, so a fetch there is a
-stall you sit through. The plugin always answers from something it already has:
+The table is cached under `$XDG_CACHE_HOME/opencode-plugin-litellm-pricing/`
+(`~/.cache/…` by default), keyed by URL:
 
 | source | when |
 | --- | --- |
-| `cache` | a copy under `$XDG_CACHE_HOME/opencode-plugin-litellm-pricing/` (`~/.cache/…` by default) less than 7 days old |
-| `stale cache (refreshing)` | that copy is older than 7 days — served anyway, with a refresh in the background |
-| `snapshot (refreshing)` | no cache at all: the price table shipped inside the package, likewise with a background refresh. With a custom `pricingURL`, its entries arrive with the first refresh |
+| `cache` | the cached copy is less than 7 days old — no network at all |
+| `stale cache (refreshing)` | it is older than 7 days: served anyway, with a refresh in the background |
+| the price-table URL | no cache yet, so the table is fetched before the picker is built (3-second limit) |
 
-The startup log names which one answered. Only an unreadable snapshot sends the
-plugin to the network while you wait, and even then models are injected — just
-without a `cost` block.
+The startup log names which one answered. Only the first start after install
+waits on that fetch. No price table ships in the package: it would be stale
+before you installed it, and OpenCode calls the plugin's `config` hook exactly
+once, before anything is displayed, so there is no later pass that could correct
+prices injected from a stale copy. If the fetch fails, models are injected
+without a `cost` block and the log says so.
 
 ## Non-chat models
 
@@ -149,13 +152,12 @@ plugin does nothing.
 - OpenCode with plugin support
 - Node 22+
 - A reachable LiteLLM proxy
-- Outbound access to the price-table URL to refresh prices. Not required to run:
-  a table ships with the package and refreshes happen in the background
+- Outbound access to the price-table URL. Needed on the first start; after
+  that the cache answers and refreshes happen in the background
 
 ## Releasing
 
-Tag-driven. Refresh the shipped price table (`npm run update-snapshot`), bump
-`version` in `package.json`, then push a matching tag:
+Tag-driven. Bump `version` in `package.json`, then push a matching tag:
 
 ```sh
 git tag v0.1.1

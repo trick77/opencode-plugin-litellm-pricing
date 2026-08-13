@@ -8,15 +8,16 @@
 // carries their gateway's own model names — those then price by exact key
 // instead of by lucky substring.
 //
-// The table comes from disk — a week-long cache, falling back to a snapshot
-// shipped in the package — and never from a fetch the user is waiting on. See
-// load() for that ordering; it is the difference between instant startup and a
-// multi-second stall on a slow network.
+// The table comes from a week-long on-disk cache. Once that cache exists no
+// start ever waits on the network again: a stale copy is served immediately and
+// refreshed behind the user's back. Only the very first start after install has
+// nothing to read, and that one waits for the fetch — the `config` hook runs
+// exactly once, before anything is displayed, so a model injected unpriced
+// there stays unpriced for the whole session. See load() for the ordering.
 //
-// LiteLLM's own per-deployment prices (from the proxy's /v1/model/info) are
-// deliberately not used: they depend on the deployment having base_model set
-// correctly, which is easy to get wrong and then silently bills $0. Matching
-// against the table gives the same answer for every key, through one code path.
+// LiteLLM's own per-deployment prices (from the proxy's /v1/model/info) are not
+// used because reading that endpoint requires an admin key — a normal virtual
+// key gets nothing back, so it is not a source the plugin can rely on.
 
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
@@ -24,22 +25,6 @@ import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { CostBlock, LiteLLMModelInfo } from './types.ts'
 import { buildCost } from './build-config-model.ts'
-import { PRICE_TABLE_SNAPSHOT } from './price-table-snapshot.ts'
-
-/**
- * The shipped snapshot, swappable for tests.
- *
- * With a real snapshot present the "no price table at all" path in load() is
- * unreachable — which is the point, but it also means the code that explains
- * that failure to the user would never be exercised. Tests blank this to reach
- * it. Nothing else writes to it.
- */
-let snapshotTable: unknown = PRICE_TABLE_SNAPSHOT
-
-/** Replace the shipped snapshot — used by tests. */
-export function setSnapshotForTests(value: unknown): void {
-  snapshotTable = value
-}
 
 /**
  * LiteLLM's published price table — the default source.
@@ -108,10 +93,9 @@ interface Candidate {
 }
 
 /**
- * Bound on the price-table fetch. Nothing on the startup path waits for it —
- * it applies to the background refresh, and to the unreachable last-resort
- * branch in load(). Short on purpose: a refresh that misses this window simply
- * happens next launch.
+ * Bound on the price-table fetch: the background refresh, and the first-start
+ * fetch in load() that has no cache to fall back on. Short on purpose — that
+ * first start is the only one anybody waits through.
  */
 const CATALOG_TIMEOUT_MS = 3_000
 
@@ -131,8 +115,8 @@ export function getCatalogStatus(url: string): CatalogStatus {
  * Load the price table for `url` once per process (memoized).
  *
  * Safe to await from inside the `config` hook, which is where the configured
- * URL first becomes readable: every branch that can answer resolves from disk
- * (cache, then the shipped snapshot) and demotes the network to a background
+ * URL first becomes readable: every branch but the very first start answers
+ * from the on-disk cache, and demotes the network to a background
  * refresh. See load().
  */
 export function getCatalog(url: string): Promise<Catalog | null> {
@@ -196,8 +180,7 @@ const CACHE_SCHEMA = 2
  * publishes ~1.7 MB; restricted to these keys it is ~700 KB, which is what it
  * costs to re-read on every single start.
  *
- * Keep in step with scripts/update-snapshot.mjs, which trims the shipped
- * snapshot the same way — and bump CACHE_SCHEMA when this list changes.
+ * Bump CACHE_SCHEMA when this list changes.
  */
 const KEEP_FIELDS = [
   'litellm_provider',
@@ -226,8 +209,8 @@ const KEEP_FIELDS = [
  * looks at PREFERRED_PROVIDERS, but the exact-key matcher looks at everything,
  * and a custom table's enriched entries carry whatever `litellm_provider` their
  * operator gave them. Dropping non-preferred providers here would strip exactly
- * those entries out of the cache and the snapshot, and the feature would fail
- * silently for the case it exists for.
+ * those entries out of the cache, and the feature would fail silently for the
+ * case it exists for.
  */
 function toTable(raw: unknown): Record<string, Record<string, unknown>> | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
@@ -351,7 +334,7 @@ function refreshInBackground(url: string): void {
  * The refresh resolves `cachePath()` when it *writes*, not when it starts, and
  * the suite swaps `XDG_CACHE_HOME` per scenario. A refresh still in flight when
  * the next scenario begins therefore writes a valid cache into the NEXT test's
- * directory, which silently turns a snapshot-branch assertion into a cache hit.
+ * directory, which silently turns a no-table assertion into a cache hit.
  * Settling it at the end of each scenario is what keeps the branches isolated.
  */
 export async function settleRefreshForTests(): Promise<void> {
@@ -401,20 +384,12 @@ async function load(url: string): Promise<{ catalog: Catalog | null; status: Cat
     return ok(fromCache, 'stale cache (refreshing)', t0)
   }
 
-  // 3. No usable cache — a fresh install, or one that was cleared. The shipped
-  //    snapshot covers it, so even this case costs nothing. It is upstream's
-  //    table, so a custom URL's own entries are missing until the background
-  //    refresh lands; upstream prices for one start beat no prices at all.
-  const snapshot = toTable(snapshotTable)
-  const fromSnapshot = snapshot && catalogFrom(snapshot)
-  if (fromSnapshot) {
-    refreshInBackground(url)
-    return ok(fromSnapshot, 'snapshot (refreshing)', t0)
-  }
-
-  // 4. Only if the shipped snapshot is itself unusable, which should not be
-  //    reachable — it is generated and asserted non-empty at build time. Kept
-  //    so a corrupted package degrades to a bounded wait instead of no prices.
+  // 3. No cache at all — a fresh install, or one that was cleared. This is the
+  //    one branch that waits, because there is nothing else that could price
+  //    this run: the `config` hook is invoked exactly once, before anything is
+  //    displayed, so a model injected unpriced here stays unpriced for the
+  //    whole session. Bounded by CATALOG_TIMEOUT_MS, and it happens once —
+  //    every later start answers from branch 1 without touching the network.
   try {
     const table = await fetchTable(url)
     const catalog = catalogFrom(table)

@@ -17,8 +17,7 @@
   },
   "scripts": {
     "build": "tsc --noEmit",
-    "test": "tsc --noEmit && node --test test/*.test.ts",
-    "update-snapshot": "node scripts/update-snapshot.mjs"
+    "test": "tsc --noEmit && node --test test/*.test.ts"
   },
   "keywords": [
     "opencode",
