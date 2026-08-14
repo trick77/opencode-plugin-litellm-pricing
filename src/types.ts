@@ -1,14 +1,14 @@
 // Core types for the opencode-plugin-litellm-pricing plugin.
 //
 // Models the subset of LiteLLM's OpenAI-compatible /v1/models and
-// /v1/model/info payloads the plugin needs, including the cost fields used
-// to populate opencode's per-model `cost` block.
+// /model_group/info payloads the plugin needs, plus the price-map entry shape
+// the cost fields for opencode's per-model `cost` block are read from.
 
 /**
  * A single model entry returned by LiteLLM's `/v1/models` endpoint.
- * LiteLLM follows the OpenAI-compatible schema; capability/limit fields
- * are LiteLLM-specific extensions that are only reliably present via
- * `/v1/model/info`.
+ * LiteLLM follows the OpenAI-compatible schema; the capability/limit fields
+ * below are LiteLLM-specific extensions that `/v1/models` does not carry —
+ * `enrichModel` overlays them from `/model_group/info`.
  */
 export interface LiteLLMModel {
   id: string
@@ -20,7 +20,7 @@ export interface LiteLLMModel {
   /**
    * LiteLLM `mode` — see {@link LITELLM_CHAT_MODES} for the documented values.
    * NOT returned by `/v1/models`: its documented response shape is
-   * `{id, object, created, owned_by}`. Present via `/v1/model/info`.
+   * `{id, object, created, owned_by}`. Present via `/model_group/info`.
    */
   mode?: string
   max_tokens?: number
@@ -39,24 +39,19 @@ export interface LiteLLMModelsResponse {
 }
 
 /**
- * The `model_info` block of a `/v1/model/info` entry. Carries `mode`,
- * token limits, capability flags, and — the reason this plugin exists —
- * the resolved per-token cost fields.
+ * A LiteLLM price-map entry: `mode`, token limits, capability flags, and —
+ * the reason this plugin exists — per-token cost fields.
  *
- * Cost field names follow LiteLLM's price map
- * (`model_prices_and_context_window.json`). Values are USD **per token**;
- * opencode expects USD **per 1,000,000 tokens**, so the cost mapper scales
- * them by 1e6.
+ * Field names follow LiteLLM's `model_prices_and_context_window.json`, which
+ * is both the format of the price table the catalog reads and the shape of
+ * the `model_info` block LiteLLM's own endpoints return. Cost values are USD
+ * **per token**; opencode expects USD **per 1,000,000 tokens**, so the cost
+ * mapper scales them by 1e6.
  *
- * NOTE: the exact set of cost keys the proxy surfaces (and whether tiered
- * `*_above_200k_tokens` keys appear) is confirmed against a live
- * `/v1/model/info` response before the cost mapper relies on them.
+ * Two readers: `buildCost` (the cost fields) and `enrichModel` (everything
+ * else, overlaid onto a lean `/v1/models` entry).
  */
 export interface LiteLLMModelInfo {
-  id?: string
-  db_model?: boolean
-  /** Alias LiteLLM assigns to the model; mirrors the `/v1/models` id. */
-  key?: string
   mode?: string
   max_tokens?: number
   max_input_tokens?: number
@@ -66,8 +61,6 @@ export interface LiteLLMModelInfo {
   supports_reasoning?: boolean
   supports_pdf_input?: boolean
   supports_audio_input?: boolean
-  /** The real price-map key for Azure/custom deployments (e.g. "azure/gpt-5.4"). */
-  base_model?: string
   // --- cost (USD per token) ---
   input_cost_per_token?: number
   output_cost_per_token?: number
@@ -80,17 +73,6 @@ export interface LiteLLMModelInfo {
   output_cost_per_token_above_200k_tokens?: number | null
   cache_read_input_token_cost_above_200k_tokens?: number | null
   cache_creation_input_token_cost_above_200k_tokens?: number | null
-}
-
-/** A single entry returned by LiteLLM's `/v1/model/info` endpoint. */
-export interface LiteLLMModelInfoEntry {
-  model_name: string
-  litellm_params?: Record<string, unknown>
-  model_info?: LiteLLMModelInfo
-}
-
-export interface LiteLLMModelInfoResponse {
-  data?: LiteLLMModelInfoEntry[]
 }
 
 /**

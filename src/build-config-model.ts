@@ -108,9 +108,9 @@ export function groupInfoToModelInfo(group: LiteLLMModelGroupInfo): LiteLLMModel
 }
 
 /**
- * Overlay /v1/model/info metadata onto a /v1/models entry (the lean entry
+ * Overlay /model_group/info metadata onto a /v1/models entry (the lean entry
  * wins; the info block fills gaps — notably `mode`, token limits, and
- * capability flags, which /v1/models omits for database-defined models).
+ * capability flags, which /v1/models does not carry at all).
  */
 export function enrichModel(model: LiteLLMModel, info: LiteLLMModelInfo): LiteLLMModel {
   return {
@@ -128,77 +128,73 @@ export function enrichModel(model: LiteLLMModel, info: LiteLLMModelInfo): LiteLL
 }
 
 /**
- * Convert a discovered LiteLLM model into an opencode config model entry.
- * Merges `info` onto `model` first (single code path), then returns `null`
- * for anything that isn't a chat model (embedding/image/audio/rerank/
- * moderation) so non-chat models don't clutter the picker.
- */
-export function toConfigModel(
-  model: LiteLLMModel,
-  info: LiteLLMModelInfo | undefined,
-): Record<string, unknown> | null {
-  const m = info ? enrichModel(model, info) : model
-
-  if (categorizeModel(m) !== 'chat') return null
-
-  const entry: Record<string, unknown> = { name: formatModelName(m) }
-
-  // LiteLLM semantics: max_input_tokens = context window; max_output_tokens
-  // = max completion; max_tokens is the legacy alias of max_output_tokens
-  // (NOT total context). Emit a limit only when the context window is known,
-  // so we never report a bogus 0-token window.
-  const context = m.max_input_tokens
-  const output = m.max_output_tokens ?? m.max_tokens
-  if (context != null && output != null) {
-    entry.limit = { context, output }
-  }
-
-  const cost = buildCost(info)
-  if (cost) entry.cost = cost
-
-  if (m.supports_function_calling) entry.tool_call = true
-  if (m.supports_reasoning) entry.reasoning = true
-  if (m.supports_vision) entry.attachment = true
-
-  const input: Array<'text' | 'image' | 'pdf' | 'audio'> = ['text']
-  if (m.supports_vision) input.push('image')
-  if (m.supports_pdf_input) input.push('pdf')
-  if (m.supports_audio_input) input.push('audio')
-  if (input.length > 1) entry.modalities = { input, output: ['text'] }
-
-  return entry
-}
-
-/**
- * The live path: build a config entry for a discovered model.
+ * Build a config entry for a discovered model.
  *
- * `model` should already carry whatever `/model_group/info` returned, so
- * `categorizeModel` can classify on LiteLLM's own `mode` and fall back to the
- * id heuristic only when there isn't one.
+ * Returns `null` for anything that isn't a chat model (embedding/image/audio/
+ * rerank/moderation) so non-chat models don't clutter the picker.
+ *
+ * `model` should already carry whatever `/model_group/info` returned (apply it
+ * with `enrichModel` first), so `categorizeModel` can classify on LiteLLM's own
+ * `mode` and fall back to the id heuristic only when there isn't one.
  *
  * LiteLLM's limits and capability flags win where present; `fields` (matched
  * from the price-table catalog) supply cost and fill the remaining gaps, and
  * may be null when nothing matched — the model is still injected, just barer.
+ * Cost is never sourced from the proxy: LiteLLM's per-model numbers depend on
+ * the deployment setting `base_model` correctly, and getting that wrong bills
+ * $0 silently.
  */
 export function configModelFromCatalog(
   model: LiteLLMModel,
   fields: CatalogFields | null,
 ): Record<string, unknown> | null {
-  // Identical to `toConfigModel` with no info block (no cost is ever sourced
-  // from the proxy), so it goes through that one implementation rather than a
-  // second copy of the limit/flag/modality logic that could drift.
-  const entry = toConfigModel(model, undefined)
-  if (!entry) return null
+  if (categorizeModel(model) !== 'chat') return null
+
+  const entry: Record<string, unknown> = { name: formatModelName(model) }
+
+  // LiteLLM semantics: max_input_tokens = context window; max_output_tokens
+  // = max completion; max_tokens is the legacy alias of max_output_tokens
+  // (NOT total context). Emit a limit only when the context window is known,
+  // so we never report a bogus 0-token window.
+  const context = model.max_input_tokens
+  const output = model.max_output_tokens ?? model.max_tokens
+  if (context != null && output != null) {
+    entry.limit = { context, output }
+  }
+
+  if (model.supports_function_calling) entry.tool_call = true
+  if (model.supports_reasoning) entry.reasoning = true
+  if (model.supports_vision) entry.attachment = true
+
+  const input: Array<'text' | 'image' | 'pdf' | 'audio'> = ['text']
+  if (model.supports_vision) input.push('image')
+  if (model.supports_pdf_input) input.push('pdf')
+  if (model.supports_audio_input) input.push('audio')
+  if (input.length > 1) entry.modalities = { input, output: ['text'] }
+
   if (fields) applyCatalogFields(entry, fields)
   return entry
 }
 
 type Modalities = { input: string[]; output: string[] }
 
-/** Merge catalog fields into an entry, without overwriting existing keys. */
+/** Copy a cost block, nested tier included — a shallow spread would alias it. */
+function cloneCost(cost: CostBlock): CostBlock {
+  const { context_over_200k, ...tier } = cost
+  return context_over_200k ? { ...tier, context_over_200k: { ...context_over_200k } } : { ...tier }
+}
+
+/**
+ * Merge catalog fields into an entry, without overwriting existing keys.
+ *
+ * Copies rather than aliases: `catalog.resolve()` hands back the SAME
+ * `CatalogFields` object for every model that matched one table entry, so
+ * assigning it directly would put one shared cost/limit object into several
+ * places in opencode's config tree.
+ */
 export function applyCatalogFields(entry: Record<string, unknown>, fields: CatalogFields): void {
-  if (fields.cost && !entry.cost) entry.cost = fields.cost
-  if (fields.limit && !entry.limit) entry.limit = fields.limit
+  if (fields.cost && !entry.cost) entry.cost = cloneCost(fields.cost)
+  if (fields.limit && !entry.limit) entry.limit = { ...fields.limit }
   if (fields.reasoning && entry.reasoning == null) entry.reasoning = true
   if (fields.tool_call && entry.tool_call == null) entry.tool_call = true
   if (fields.attachment && entry.attachment == null) entry.attachment = true
@@ -212,7 +208,8 @@ export function applyCatalogFields(entry: Record<string, unknown>, fields: Catal
 function mergeModalities(entry: Record<string, unknown>, fromCatalog: Modalities): void {
   const existing = entry.modalities as Modalities | undefined
   if (!existing) {
-    entry.modalities = fromCatalog
+    // Copied, not aliased — see applyCatalogFields.
+    entry.modalities = { input: [...fromCatalog.input], output: [...fromCatalog.output] }
     return
   }
   const input = [...existing.input]
