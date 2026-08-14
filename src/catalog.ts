@@ -520,9 +520,8 @@ function num(v: unknown): number | undefined {
 /**
  * Map a price-table entry to config fields.
  *
- * Cost goes through `buildCost`, the same mapper the (unused) /v1/model/info
- * reader uses: the table states costs in USD per TOKEN and opencode wants USD
- * per 1M, so the ×1e6 scaling is not optional. The 200k tier and the deliberate
+ * Cost goes through `buildCost`: the table states costs in USD per TOKEN and
+ * opencode wants USD per 1M, so the ×1e6 scaling is not optional. The 200k tier and the deliberate
  * non-mapping of `*_above_272k_tokens` come with it.
  */
 export function toCatalogFields(entry: Record<string, unknown>): CatalogFields {

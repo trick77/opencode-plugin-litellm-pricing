@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildCost, configModelFromCatalog, toConfigModel } from '../src/build-config-model.ts'
+import { buildCost, configModelFromCatalog } from '../src/build-config-model.ts'
 import type { LiteLLMModel, LiteLLMModelInfo } from '../src/types.ts'
 
 // Values below are taken verbatim from a real LiteLLM /v1/model/info
@@ -69,20 +69,20 @@ test('a real 0 cost is kept, not dropped; cost omitted only when a rate is absen
 
 test('embedding-mode models are filtered out of the picker', () => {
   const model = { id: 'ai-gateway-text-embedding-3-small', object: 'model', mode: 'embedding' } as LiteLLMModel
-  assert.equal(toConfigModel(model, { input_cost_per_token: 2e-8, output_cost_per_token: 0 }), null)
+  assert.equal(configModelFromCatalog(model, null), null)
 })
 
 test('rerank/moderation models are filtered out (only chat is injected)', () => {
   const rerank = { id: 'cohere-rerank-v3', object: 'model', mode: 'rerank' } as LiteLLMModel
   const moderation = { id: 'omni-moderation', object: 'model', mode: 'moderation' } as LiteLLMModel
-  assert.equal(toConfigModel(rerank, undefined), null)
-  assert.equal(toConfigModel(moderation, undefined), null)
+  assert.equal(configModelFromCatalog(rerank, null), null)
+  assert.equal(configModelFromCatalog(moderation, null), null)
 })
 
 test('a chat model with "audio" in its id is NOT hidden when mode is absent', () => {
   // gpt-4o-audio-preview is a chat model; the id heuristic must not hide it.
   const model = { id: 'gpt-4o-audio-preview', object: 'model' } as LiteLLMModel
-  const entry = toConfigModel(model, undefined)
+  const entry = configModelFromCatalog(model, null)
   assert.notEqual(entry, null)
   assert.equal(entry!.name, 'GPT 4o Audio Preview')
 })
@@ -90,7 +90,7 @@ test('a chat model with "audio" in its id is NOT hidden when mode is absent', ()
 test('limit uses max_tokens as the output fallback and never emits context 0', () => {
   // Only max_output known → no context window known → no limit (not context:0).
   const outputOnly = { id: 'm', object: 'model', mode: 'chat', max_output_tokens: 4096 } as LiteLLMModel
-  assert.equal(toConfigModel(outputOnly, undefined)!.limit, undefined)
+  assert.equal(configModelFromCatalog(outputOnly, null)!.limit, undefined)
   // max_tokens is LiteLLM's legacy alias for max output, used as the fallback.
   const withMaxTokens = {
     id: 'm2',
@@ -99,7 +99,7 @@ test('limit uses max_tokens as the output fallback and never emits context 0', (
     max_input_tokens: 200000,
     max_tokens: 8192,
   } as LiteLLMModel
-  assert.deepEqual(toConfigModel(withMaxTokens, undefined)!.limit, { context: 200000, output: 8192 })
+  assert.deepEqual(configModelFromCatalog(withMaxTokens, null)!.limit, { context: 200000, output: 8192 })
 })
 
 test('configModelFromCatalog: filters non-chat by name, applies catalog fields to chat', () => {
@@ -179,10 +179,14 @@ test('chat model carries name, limit, cost, and capability flags', () => {
     supports_reasoning: true,
     supports_vision: true,
   }
-  const entry = toConfigModel(model, {
-    input_cost_per_token: 2.5e-6,
-    output_cost_per_token: 1.5e-5,
-    cache_read_input_token_cost: 2.5e-7,
+  // Cost comes from the catalog, the only source there is — the per-token
+  // figures below are what buildCost() turns the table's entry into.
+  const entry = configModelFromCatalog(model, {
+    cost: buildCost({
+      input_cost_per_token: 2.5e-6,
+      output_cost_per_token: 1.5e-5,
+      cache_read_input_token_cost: 2.5e-7,
+    }),
   })!
   assert.equal(entry.name, 'AI Gateway GPT 5.4')
   assert.deepEqual(entry.limit, { context: 1050000, output: 128000 })
