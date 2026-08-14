@@ -2,11 +2,12 @@
 //
 // Cost, context limits and capability flags come from a price table in
 // LiteLLM's `model_prices_and_context_window.json` format, matched to the
-// LiteLLM model by name. The URL is configurable (`options.pricingURL`), which
-// is the point: LiteLLM's own published table covers the public providers,
-// while a proxy operator can serve an enriched copy of the same file that also
-// carries their gateway's own model names — those then price by exact key
-// instead of by lucky substring.
+// LiteLLM model by name. The URL comes from `options.pricingURL` and there is
+// no default: the plugin fetches the table its operator names and nothing else.
+// LiteLLM's own published table is the obvious thing to point it at, but a
+// proxy operator can serve an enriched copy of the same file that also carries
+// their gateway's own model names — those then price by exact key instead of by
+// lucky substring.
 //
 // The table comes from a week-long on-disk cache. Once that cache exists no
 // start ever waits on the network again: a stale copy is served immediately and
@@ -25,15 +26,6 @@ import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { CostBlock, LiteLLMModelInfo } from './types.ts'
 import { buildCost } from './build-config-model.ts'
-
-/**
- * LiteLLM's published price table — the default source.
- *
- * Anything serving the same format works: point `options.pricingURL` at an
- * enriched copy and its extra entries price by exact model name.
- */
-export const DEFAULT_PRICE_TABLE_URL =
-  'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json'
 
 // Providers whose entries may be matched by SUBSTRING, in precedence order.
 // These LiteLLM deployments are Azure/OpenAI; both carry the full model line

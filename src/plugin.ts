@@ -14,10 +14,12 @@
 // `options.baseURL` is required. The plugin talks to that URL and nothing
 // else: there is no default and no port auto-detection.
 //
-// `options.pricingURL` is optional and defaults to LiteLLM's own published
-// table. Point it at an enriched copy of that file — same format, plus entries
-// for your gateway's own model names — and those models price by exact name
-// instead of by substring match against the public model line.
+// `options.pricingURL` is required for pricing, and has no default: point it
+// at a price table in LiteLLM's `model_prices_and_context_window.json` format.
+// LiteLLM's own published table is the obvious choice; an enriched copy — same
+// format, plus entries for your gateway's own model names — prices those models
+// by exact name instead of by substring match against the public model line.
+// Without it, models are still discovered and injected, just unpriced.
 //
 // Configure in opencode.json:
 //
@@ -46,7 +48,7 @@ import {
   resolveApiKey,
 } from './litellm-api.ts'
 import { configModelFromCatalog, enrichModel, groupInfoToModelInfo } from './build-config-model.ts'
-import { DEFAULT_PRICE_TABLE_URL, getCatalog, getCatalogStatus } from './catalog.ts'
+import { getCatalog, getCatalogStatus } from './catalog.ts'
 
 // Default provider id — kept identical to the npm package name so the
 // `plugin` and `provider` keys in opencode.json read the same.
@@ -202,17 +204,34 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
         // no second pass to price into. After the first start it costs nothing
         // — the load answers from the on-disk cache and refreshes in the
         // background (see catalog.ts).
+        //
+        // There is no default URL, for the same reason there is no default
+        // baseURL: the plugin fetches what its operator named and nothing else.
+        // An unset pricingURL is a configuration gap to report, not a licence
+        // to reach out to a hardcoded third-party host on every fresh install.
+        // Discovery still runs — the models are worth having unpriced, and the
+        // warning says exactly why they have no cost.
         const pricingURL =
           typeof options.pricingURL === 'string' && options.pricingURL
             ? options.pricingURL
-            : DEFAULT_PRICE_TABLE_URL
-        const catalog = await getCatalog(pricingURL)
+            : undefined
+        const catalog = pricingURL ? await getCatalog(pricingURL) : null
         const resolveCatalog = (name: string): CatalogFields | null =>
           catalog?.resolve(name) ?? null
 
-        // Once per price-table URL, not per provider: two providers sharing a
-        // table share its one load, so a second report would only repeat it.
-        if (!reportedCatalogs.has(pricingURL)) {
+        if (!pricingURL) {
+          // Warned once per provider, not once per process: two providers can
+          // be misconfigured independently, and naming the one that is missing
+          // its table is the whole value of the message.
+          report(
+            'warn',
+            `[litellm-pricing] provider "${providerId}" has no options.pricingURL — ` +
+              'set it to a price table in LiteLLM `model_prices_and_context_window.json` ' +
+              'format; every model will be injected without pricing.',
+          )
+        } else if (!reportedCatalogs.has(pricingURL)) {
+          // Once per price-table URL, not per provider: two providers sharing a
+          // table share its one load, so a second report would only repeat it.
           reportedCatalogs.add(pricingURL)
           const status = getCatalogStatus(pricingURL)
           // `ok` always carries a non-empty catalog — catalogFrom() returns null
