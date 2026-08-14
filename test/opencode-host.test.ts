@@ -57,6 +57,12 @@ async function runConfigHook(
      * scenario's provider will actually resolve — the default otherwise.
      */
     seed?: { url?: string; table: unknown; ageMs: number; v?: number }
+    /**
+     * Extra `config` invocations, run after the first. Each callback prepares
+     * the config for the pass that follows it. opencode calls the hook once,
+     * but the plugin's re-entry bookkeeping only shows up across passes.
+     */
+    rerun?: Array<() => void>
   } = {},
 ) {
   resetCatalogCache()
@@ -85,6 +91,10 @@ async function runConfigHook(
       // which is why the price table has to be loaded before the hook runs.
       const hooks = await plugin(input)
       await hooks.config?.(config as unknown as Config)
+      for (const prepare of opts.rerun ?? []) {
+        prepare()
+        await hooks.config?.(config as unknown as Config)
+      }
       return config
     }),
   )
@@ -744,4 +754,81 @@ test('an SDK without client.app.log does not lose every model', async () => {
     PROVIDER_KEY
   ]!.models
   assert.ok(models['ai-gateway-gpt-5.4'], 'the model must survive an unloggable host')
+})
+
+// 18 — the baseURL handed to the SDK.
+//
+// `normalizeBaseURL` accepts a baseURL with or without `/v1`, and discovery
+// works either way. `@ai-sdk/openai-compatible` does not: it POSTs
+// `${baseURL}/chat/completions`. Passing the user's spelling straight through
+// produced a picker full of correctly-priced models that 404 on every request
+// — with the summary line reporting complete success.
+test('the SDK baseURL always carries /v1, whichever form was configured', async () => {
+  for (const [configured, host] of [
+    ['https://proxy-nov1.test', 'https://proxy-nov1.test'],
+    ['https://proxy-withv1.test/v1', 'https://proxy-withv1.test'],
+    ['https://proxy-slash.test/v1/', 'https://proxy-slash.test'],
+  ] as const) {
+    const config = providerConfig(configured)
+    await runConfigHook(config, {
+      '/v1/models': () => modelsResponse(CHAT_MODEL),
+      '/model_group/info': () =>
+        json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
+    })
+
+    const provider = config.provider[PROVIDER_KEY]!
+    const options = provider.options as Record<string, unknown>
+    assert.equal(options.baseURL, `${host}/v1`, `configured as ${configured}`)
+    // The rest of the options block survives the rewrite.
+    assert.equal(options.apiKey, 'sk-test', `apiKey lost for ${configured}`)
+    // And discovery still ran against the normalized host.
+    const models = provider.models as Record<string, unknown>
+    assert.ok(models['ai-gateway-gpt-5.4'], `nothing injected for ${configured}`)
+  }
+})
+
+// 19 — re-entry bookkeeping across repeated `config` passes.
+//
+// The plugin must keep telling its own earlier entries apart from the user's
+// hand-written ones. Tracking only the ids added by the LATEST pass loses that
+// after the first re-entry, and the summary then credits the user with models
+// the plugin injected itself.
+test('models we injected stay ours across repeated config passes', async () => {
+  const config = providerConfig('https://proxy-reentry.test/v1')
+  const models = () => config.provider[PROVIDER_KEY]!.models as Record<string, unknown>
+  // Drop one injected id before each re-run, so the early-return guard does not
+  // short-circuit and the remaining id goes down the already-injected branch.
+  const dropOne = () => {
+    delete models()['ai-gateway-gpt-5.4']
+  }
+
+  const { logs } = await runConfigHook(
+    config,
+    {
+      '/v1/models': () => modelsResponse(CHAT_MODEL, { id: 'house-chat', object: 'model' }),
+      '/model_group/info': () =>
+        json({
+          data: [
+            { model_group: 'ai-gateway-gpt-5.4', mode: 'chat' },
+            { model_group: 'house-chat', mode: 'chat' },
+          ],
+        }),
+    },
+    { rerun: [dropOne, dropOne] },
+  )
+
+  const summaries = logs.filter((l) => l.includes('discovered,'))
+  assert.equal(summaries.length, 3, `expected three summaries, got: ${logs.join(' | ')}`)
+  // Passes 2 and 3 both re-add the dropped id and re-encounter `house-chat`,
+  // which we injected on pass 1. It must never be reported as the user's.
+  for (const [i, summary] of summaries.slice(1).entries()) {
+    assert.ok(
+      summary.includes('1 already injected'),
+      `pass ${i + 2} should recognise its own entry: ${summary}`,
+    )
+    assert.ok(
+      !summary.includes('already present'),
+      `pass ${i + 2} credited the user with our entry: ${summary}`,
+    )
+  }
 })

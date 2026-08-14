@@ -195,10 +195,23 @@ export function configModelFromCatalog(
 
 type Modalities = { input: string[]; output: string[] }
 
-/** Merge catalog fields into an entry, without overwriting existing keys. */
+/** Copy a cost block, nested tier included — a shallow spread would alias it. */
+function cloneCost(cost: CostBlock): CostBlock {
+  const { context_over_200k, ...tier } = cost
+  return context_over_200k ? { ...tier, context_over_200k: { ...context_over_200k } } : { ...tier }
+}
+
+/**
+ * Merge catalog fields into an entry, without overwriting existing keys.
+ *
+ * Copies rather than aliases: `catalog.resolve()` hands back the SAME
+ * `CatalogFields` object for every model that matched one table entry, so
+ * assigning it directly would put one shared cost/limit object into several
+ * places in opencode's config tree.
+ */
 export function applyCatalogFields(entry: Record<string, unknown>, fields: CatalogFields): void {
-  if (fields.cost && !entry.cost) entry.cost = fields.cost
-  if (fields.limit && !entry.limit) entry.limit = fields.limit
+  if (fields.cost && !entry.cost) entry.cost = cloneCost(fields.cost)
+  if (fields.limit && !entry.limit) entry.limit = { ...fields.limit }
   if (fields.reasoning && entry.reasoning == null) entry.reasoning = true
   if (fields.tool_call && entry.tool_call == null) entry.tool_call = true
   if (fields.attachment && entry.attachment == null) entry.attachment = true
@@ -212,7 +225,8 @@ export function applyCatalogFields(entry: Record<string, unknown>, fields: Catal
 function mergeModalities(entry: Record<string, unknown>, fromCatalog: Modalities): void {
   const existing = entry.modalities as Modalities | undefined
   if (!existing) {
-    entry.modalities = fromCatalog
+    // Copied, not aliased — see applyCatalogFields.
+    entry.modalities = { input: [...fromCatalog.input], output: [...fromCatalog.output] }
     return
   }
   const input = [...existing.input]

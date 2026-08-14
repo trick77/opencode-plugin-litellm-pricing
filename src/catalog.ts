@@ -145,9 +145,15 @@ export function getCatalog(url: string): Promise<Catalog | null> {
   return entry.promise
 }
 
-/** Clear the memoized catalogs — used by tests. */
+/**
+ * Clear the memoized catalogs — used by tests.
+ *
+ * Deliberately does NOT clear `pendingRefreshes`: those are the handles
+ * `settleRefreshForTests` needs, and dropping them re-arms the very leak it
+ * exists to prevent (an in-flight refresh writing its cache into the NEXT
+ * scenario's XDG_CACHE_HOME). It drains the array itself as it settles.
+ */
 export function resetCatalogCache(): void {
-  pendingRefreshes.length = 0
   loads.clear()
 }
 

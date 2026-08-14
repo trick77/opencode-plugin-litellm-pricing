@@ -72,8 +72,10 @@ interface MutableConfig {
 
 /**
  * opencode invokes the `config` hook several times per run with a
- * cumulative config object. Track which model ids we already injected per
- * baseURL so repeat invocations return early instead of re-querying.
+ * cumulative config object. Track which model ids we already injected, keyed
+ * by provider and baseURL, so repeat invocations return early instead of
+ * re-querying — and so a re-entry can tell our own earlier entries apart from
+ * the user's hand-written ones.
  */
 const injectedModelIds = new Map<string, Set<string>>()
 
@@ -240,19 +242,32 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           }
         }
 
-        // Ensure the provider entry exists and is minimally wired.
-        if (!providers[providerId]) providers[providerId] = provider
-        const actual = providers[providerId]!
+        // Ensure the provider entry is minimally wired.
+        //
+        // The baseURL is rewritten, not merely defaulted. `normalizeBaseURL`
+        // accepts both `https://host` and `https://host/v1` — discovery works
+        // either way because `buildAPIURL` appends `/v1/models` itself — but
+        // `@ai-sdk/openai-compatible` POSTs `${baseURL}/chat/completions`, so
+        // the string handed to the SDK MUST carry the `/v1`. Passing the user's
+        // spelling through unchanged is what made a `/v1`-less baseURL produce
+        // a picker full of correctly-priced models that 404 on every request,
+        // with the summary below reporting success.
+        //
+        // Idempotent for the documented form: `https://x/v1` normalizes to
+        // `https://x`, and this puts the `/v1` back.
+        const actual = provider
         if (!actual.npm) actual.npm = '@ai-sdk/openai-compatible'
-        if (!actual.options) actual.options = { baseURL: `${baseURL}/v1` }
-        else if (!(actual.options as Record<string, unknown>).baseURL) {
-          ;(actual.options as Record<string, unknown>).baseURL = `${baseURL}/v1`
-        }
+        actual.options = { ...actual.options, baseURL: `${baseURL}/v1` }
         if (!actual.models) actual.models = {}
         const models = actual.models
 
+        // Keyed by provider AND baseURL: two matched providers pointed at the
+        // same proxy keep separate bookkeeping, since they also keep separate
+        // `models` maps.
+        const injectedKey = `${providerId}\n${baseURL}`
+
         const work = async () => {
-          const already = injectedModelIds.get(baseURL)
+          const already = injectedModelIds.get(injectedKey)
           if (already && [...already].every((id) => models[id])) return
 
           // Pricing is never requested from the proxy. LiteLLM's per-model
@@ -308,7 +323,7 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           let malformed = 0
           const unpricedIds: string[] = []
           const addedIds = new Set<string>()
-          const ours = injectedModelIds.get(baseURL)
+          const ours = injectedModelIds.get(injectedKey)
           for (const model of discovered) {
             // Skip malformed entries rather than throwing out of the hook.
             if (!model || typeof model.id !== 'string') {
@@ -354,7 +369,12 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
             else unpricedIds.push(model.id)
           }
 
-          injectedModelIds.set(baseURL, addedIds)
+          // Union, not replace: `addedIds` holds only what THIS pass added, so
+          // assigning it would drop every id counted as `reinjected` and make
+          // the next pass report our own entries as the user's hand-written
+          // config — the exact miscount the `reinjected` branch above exists to
+          // prevent.
+          injectedModelIds.set(injectedKey, new Set([...(ours ?? []), ...addedIds]))
 
           // Pricing coverage is stated over the models actually injected, not
           // over everything discovered: non-chat and wildcard entries never

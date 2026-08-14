@@ -133,3 +133,25 @@ test('formatModelName strips the provider prefix and title-cases', () => {
   assert.equal(formatModelName(m('azure/ai-gateway-gpt-5.4')), 'AI Gateway GPT 5.4')
   assert.equal(formatModelName(m('claude-opus-5')), 'Claude Opus 5')
 })
+
+test('short words are title-cased; only real acronyms are shouted', () => {
+  // The old rule was `length <= 3 -> toUpperCase()`, which shouted every short
+  // WORD too — `Gemini 2.5 PRO` sitting next to a correctly-cased `Mini`.
+  assert.equal(formatModelName(m('gemini-2.5-pro')), 'Gemini 2.5 Pro')
+  assert.equal(formatModelName(m('grok-4-fast-max')), 'Grok 4 Fast Max')
+  assert.equal(formatModelName(m('claude-haiku-4-5-air')), 'Claude Haiku 4 5 Air')
+  // ...while genuine acronyms still are.
+  assert.equal(formatModelName(m('gpt-4o-mini')), 'GPT 4o Mini')
+  assert.equal(formatModelName(m('llava-hf')), 'Llava HF')
+  assert.equal(formatModelName(m('qwen2-vl-7b')), 'qwen2 VL 7b')
+})
+
+test('dots separate id segments but never split a version number', () => {
+  // Bedrock/Vertex ids are dot-separated, the same reason `categorizeModel`
+  // treats `.` as a token boundary.
+  assert.equal(formatModelName(m('amazon.nova-pro-v1:0')), 'Amazon Nova Pro v1:0')
+  assert.equal(formatModelName(m('anthropic.claude-sonnet-5')), 'Anthropic Claude Sonnet 5')
+  // But a dot between digits is part of one version token, not a separator.
+  assert.equal(formatModelName(m('gpt-3.5-turbo')), 'GPT 3.5 Turbo')
+  assert.equal(formatModelName(m('imagen-3.0-generate-002')), 'Imagen 3.0 Generate 002')
+})

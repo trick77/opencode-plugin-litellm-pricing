@@ -124,6 +124,35 @@ test('configModelFromCatalog: filters non-chat by name, applies catalog fields t
   assert.equal(entry.tool_call, true)
 })
 
+test('catalog fields are copied into each entry, never shared by reference', () => {
+  // `catalog.resolve()` hands back the SAME CatalogFields object for every
+  // model that matched one table entry. Assigning it straight in would put one
+  // cost/limit/modalities object into several places in opencode's config.
+  const fields = {
+    cost: { input: 2.5, output: 15, context_over_200k: { input: 5, output: 22.5 } },
+    limit: { context: 1050000, output: 128000 },
+    modalities: { input: ['text', 'image'], output: ['text'] },
+  }
+  const a = configModelFromCatalog({ id: 'gw-gpt-5.4', object: 'model' } as LiteLLMModel, fields)!
+  const b = configModelFromCatalog(
+    { id: 'gw-gpt-5.4-eu', object: 'model' } as LiteLLMModel,
+    fields,
+  )!
+
+  assert.notEqual(a.cost, b.cost, 'cost block shared between entries')
+  assert.notEqual(a.limit, b.limit, 'limit block shared between entries')
+  assert.notEqual(a.modalities, b.modalities, 'modalities shared between entries')
+  // The nested tier too — a shallow copy would still alias it.
+  assert.notEqual(
+    (a.cost as { context_over_200k: unknown }).context_over_200k,
+    (b.cost as { context_over_200k: unknown }).context_over_200k,
+    'the over-200k tier is shared between entries',
+  )
+  // Nothing was aliased back to the catalog's own object either.
+  assert.notEqual(a.cost, fields.cost, 'entry aliases the catalog cost object')
+  assert.deepEqual(a.cost, fields.cost, 'the copy must carry the same values')
+})
+
 test('catalog modalities are unioned with LiteLLM flags, never shrunk by them', () => {
   // LiteLLM's group info reports vision only; the price table also knows pdf. The
   // narrower proxy answer must not drop pdf from the injected entry.

@@ -64,21 +64,51 @@ export function categorizeModel(model: LiteLLMModel): ModelType {
 }
 
 /**
+ * Tokens rendered in full caps. An explicit list, not a length rule: the old
+ * `length <= 3 -> toUpperCase()` shouted every short WORD too, so
+ * `gemini-2.5-pro` read as `Gemini 2.5 PRO` next to a correctly-cased `Mini`.
+ *
+ * Only add genuine acronyms and initialisms here. A word that merely happens
+ * to be short (pro, max, air, lite, nano) is title-cased like any other.
+ */
+const ACRONYMS: ReadonlySet<string> = new Set([
+  'ai',
+  'api',
+  'gpt',
+  'hd',
+  'hf',
+  'llm',
+  'moe',
+  'ocr',
+  'sd3',
+  'tts',
+  'ui',
+  'vl',
+  'xai',
+])
+
+/**
  * Turn a raw model id into a readable display name. Strips a leading
  * provider prefix (`azure/`, `openai/`, …), splits on separators, and
- * title-cases words while preserving common all-caps / versioned tokens.
+ * title-cases words while preserving acronyms and versioned tokens.
  */
 export function formatModelName(model: LiteLLMModel): string {
   let id = model.id
   const slash = id.lastIndexOf('/')
   if (slash !== -1) id = id.slice(slash + 1)
 
-  const words = id.split(/[-_\s]+/).filter(Boolean)
+  // `.` splits too, for the same reason it is a token boundary in
+  // `categorizeModel`: Bedrock/Vertex ids are dot-separated, and without it
+  // `amazon.nova-pro-v1:0` renders as `Amazon.nova …`. But ONLY when it is not
+  // between digits — `gpt-3.5` and `gemini-2.5` are single version tokens, and
+  // splitting those would print `GPT 3 5`. `:` is left alone; `v1:0` reads
+  // fine as one token.
+  const words = id.split(/[-_\s]+|(?<![0-9])\.|\.(?![0-9])/).filter(Boolean)
   const formatted = words.map((word) => {
     // Keep tokens that already carry meaningful casing/digits as-is
-    // (e.g. "gpt", "3.5", "v2", "o1"), only capitalising plain words.
-    if (/\d/.test(word)) return word
-    if (word.length <= 3) return word.toUpperCase()
+    // (e.g. "3.5", "v2", "o1"), only capitalising plain words.
+    if (/\d/.test(word) && !ACRONYMS.has(word)) return word
+    if (ACRONYMS.has(word)) return word.toUpperCase()
     return word.charAt(0).toUpperCase() + word.slice(1)
   })
   return formatted.join(' ')
