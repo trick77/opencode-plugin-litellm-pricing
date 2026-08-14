@@ -70,22 +70,32 @@ export function categorizeModel(model: LiteLLMModel): ModelType {
  *
  * Only add genuine acronyms and initialisms here. A word that merely happens
  * to be short (pro, max, air, lite, nano) is title-cased like any other.
+ *
+ * Listed lowercase; matched case-insensitively, so a proxy that reports
+ * `Gpt-4o` still renders `GPT 4o`.
  */
 const ACRONYMS: ReadonlySet<string> = new Set([
   'ai',
   'api',
+  'glm',
   'gpt',
   'hd',
   'hf',
   'llm',
   'moe',
   'ocr',
+  'oss',
   'sd3',
   'tts',
   'ui',
   'vl',
   'xai',
 ])
+
+/** Case-insensitive membership, so `GLM`/`Glm`/`glm` all shout alike. */
+function isAcronym(word: string): boolean {
+  return ACRONYMS.has(word.toLowerCase())
+}
 
 /**
  * Turn a raw model id into a readable display name. Strips a leading
@@ -107,8 +117,8 @@ export function formatModelName(model: LiteLLMModel): string {
   const formatted = words.map((word) => {
     // Keep tokens that already carry meaningful casing/digits as-is
     // (e.g. "3.5", "v2", "o1"), only capitalising plain words.
-    if (/\d/.test(word) && !ACRONYMS.has(word)) return word
-    if (ACRONYMS.has(word)) return word.toUpperCase()
+    if (/\d/.test(word) && !isAcronym(word)) return word
+    if (isAcronym(word)) return word.toUpperCase()
     return word.charAt(0).toUpperCase() + word.slice(1)
   })
   return formatted.join(' ')

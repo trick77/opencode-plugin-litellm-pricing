@@ -144,6 +144,17 @@ test('short words are title-cased; only real acronyms are shouted', () => {
   assert.equal(formatModelName(m('gpt-4o-mini')), 'GPT 4o Mini')
   assert.equal(formatModelName(m('llava-hf')), 'Llava HF')
   assert.equal(formatModelName(m('qwen2-vl-7b')), 'qwen2 VL 7b')
+  // ...including the ones the old length rule got right and an acronym list
+  // must not lose: GLM and OSS are everyday ids on a LiteLLM proxy.
+  assert.equal(formatModelName(m('glm-4.6')), 'GLM 4.6')
+  assert.equal(formatModelName(m('gpt-oss-120b')), 'GPT OSS 120b')
+})
+
+test('acronyms are matched case-insensitively', () => {
+  // The proxy decides the casing of the id it reports; `Gpt-4o` and `GLM-4.6`
+  // must read the same as their lowercase spellings.
+  assert.equal(formatModelName(m('Gpt-4o')), 'GPT 4o')
+  assert.equal(formatModelName(m('zai-org/GLM-4.6')), 'GLM 4.6')
 })
 
 test('dots separate id segments but never split a version number', () => {
