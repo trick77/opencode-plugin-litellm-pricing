@@ -100,8 +100,16 @@ export const PRICE_TABLE = {
   },
 }
 
-/** The URL the plugin fetches when no `pricingURL` is configured. */
-export const DEFAULT_PRICE_TABLE_PATHNAME = '/BerriAI/litellm/main/model_prices_and_context_window.json'
+/**
+ * The price table the scenarios point `options.pricingURL` at. There is no
+ * default in the plugin — every provider names its own table — so this is just
+ * the URL the suite happens to configure, served by the fake proxy below.
+ */
+export const PRICE_TABLE_URL =
+  'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json'
+
+/** Its pathname, for routing inside the fake proxy. */
+export const PRICE_TABLE_PATHNAME = '/BerriAI/litellm/main/model_prices_and_context_window.json'
 
 /**
  * Write a cache file the plugin will find, aged as asked.
@@ -217,7 +225,7 @@ export async function withFakeProxy<T>(routes: Routes, fn: () => Promise<T>): Pr
     // load() in src/catalog.ts. Scenarios that don't care get the default
     // table; one that does can override the route.
     const route =
-      routes[url.pathname] ?? (url.pathname === DEFAULT_PRICE_TABLE_PATHNAME ? priceTable : undefined)
+      routes[url.pathname] ?? (url.pathname === PRICE_TABLE_PATHNAME ? priceTable : undefined)
     if (!route) throw new Error(`fake proxy: no route for ${url.pathname}`)
     return route()
   }

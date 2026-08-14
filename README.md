@@ -7,7 +7,8 @@ picker with a per-model `cost` block, so OpenCode shows real pricing instead of
 
 The proxy is asked only for its model list. Prices come from a table in
 LiteLLM's `model_prices_and_context_window.json` format, matched by model name,
-so `ai-gateway-gpt-5.4` is priced as `gpt-5.4`. The table URL is configurable.
+so `ai-gateway-gpt-5.4` is priced as `gpt-5.4`. You name the table — the plugin
+fetches no URL you did not configure.
 
 ## Install
 
@@ -23,7 +24,8 @@ Add the plugin and a LiteLLM provider to your `opencode.json`:
       "name": "LiteLLM (proxy)",
       "options": {
         "baseURL": "https://litellm.example.com/v1",
-        "apiKey": "{env:LITELLM_API_KEY}"
+        "apiKey": "{env:LITELLM_API_KEY}",
+        "pricingURL": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
       }
     }
   }
@@ -35,14 +37,21 @@ The key is read from `options.apiKey`, else `$LITELLM_API_KEY` /
 `$LITELLM_MASTER_KEY`. Extra auth headers (e.g. Cloudflare Access) go in
 `options.customHeaders`.
 
-### Your own price table
+### The price table
 
-`options.pricingURL` defaults to LiteLLM's published
-[`model_prices_and_context_window.json`][litellm-prices], which covers the
-public model line. If your gateway serves an enriched copy — the upstream
-entries plus your own model names, with their real context and pricing — set
-`options.pricingURL` to it. Same format as upstream: one flat JSON object keyed
-by model name, costs in USD per token.
+`options.pricingURL` is required for pricing and has **no default**: the plugin
+fetches the table you name and nothing else. A provider without one still gets
+its models discovered and injected — they just carry no cost, and the startup
+log says why.
+
+LiteLLM's published [`model_prices_and_context_window.json`][litellm-prices]
+covers the public model line and is what the example above points at. If your
+gateway serves an enriched copy — the upstream entries plus your own model
+names, with their real context and pricing — point `pricingURL` at that
+instead; those models then price by exact key rather than by substring against
+the public line. Same format either way: one flat JSON object keyed by model
+name, costs in USD per token. It is fetched once and cached — see
+[The cache](#the-cache).
 
 [litellm-prices]: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
 
@@ -135,7 +144,14 @@ A healthy run:
 
 Coverage is counted over the models actually added. Unpriced models are named,
 not just counted. `pricing for 0/N` is logged as a warning — usually the catalog
-line above will say it was unavailable or empty.
+line above will say it was unavailable or empty, or that no `pricingURL` was
+configured at all:
+
+```
+[litellm-pricing] provider "litellm" has no options.pricingURL — set it to a
+  price table in LiteLLM `model_prices_and_context_window.json` format;
+  every model will be injected without pricing.
+```
 
 ## Provider matching
 
@@ -150,8 +166,9 @@ plugin does nothing.
 - OpenCode with plugin support
 - Node 22+
 - A reachable LiteLLM proxy
-- Outbound access to the price-table URL. Needed on the first start; after
-  that the cache answers and refreshes happen in the background
+- A price table in LiteLLM `model_prices_and_context_window.json` format, and
+  outbound access to it. Needed on the first start; after that the cache
+  answers and refreshes happen in the background
 
 ## Releasing
 

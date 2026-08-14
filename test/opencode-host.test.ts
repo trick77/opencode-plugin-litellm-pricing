@@ -15,14 +15,11 @@ import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Config } from '@opencode-ai/plugin'
-import {
-  DEFAULT_PRICE_TABLE_URL,
-  resetCatalogCache,
-  settleRefreshForTests,
-} from '../src/catalog.ts'
+import { resetCatalogCache, settleRefreshForTests } from '../src/catalog.ts'
 import { resetReportedCatalog } from '../src/plugin.ts'
 import {
-  DEFAULT_PRICE_TABLE_PATHNAME,
+  PRICE_TABLE_PATHNAME,
+  PRICE_TABLE_URL,
   PRICE_TABLE,
   captureConsole,
   fetchedURLs,
@@ -73,7 +70,7 @@ async function runConfigHook(
   process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), 'litellm-pricing-test-'))
   if (opts.seed) {
     await seedCache(
-      opts.seed.url ?? DEFAULT_PRICE_TABLE_URL,
+      opts.seed.url ?? PRICE_TABLE_URL,
       opts.seed.table,
       opts.seed.ageMs,
       opts.seed.v,
@@ -117,7 +114,10 @@ function providerConfig(baseURL: string, extra: Record<string, unknown> = {}) {
     provider: {
       [PROVIDER_KEY]: {
         // `npm` deliberately omitted — the plugin should default it.
-        options: { baseURL, apiKey: 'sk-test' },
+        // `pricingURL` spelled out because the plugin has no default: a
+        // provider without one is injected unpriced, which is its own scenario
+        // below rather than the baseline every other scenario builds on.
+        options: { baseURL, apiKey: 'sk-test', pricingURL: PRICE_TABLE_URL },
         ...extra,
       } as Record<string, unknown>,
     },
@@ -230,7 +230,11 @@ test('the pre-rename provider id is still matched', async () => {
   const config = {
     provider: {
       'opencode-litellm-pricing': {
-        options: { baseURL: 'https://proxy-legacy-id.test/v1', apiKey: 'sk-test' },
+        options: {
+          baseURL: 'https://proxy-legacy-id.test/v1',
+          apiKey: 'sk-test',
+          pricingURL: PRICE_TABLE_URL,
+        },
       } as Record<string, unknown>,
     },
   }
@@ -436,7 +440,7 @@ test('with no table at all, the failure is reported rather than shown as $0', as
       '/v1/models': () => json({ data: MIXED_MODELS }),
       '/model_group/info': () => json({ data: [] }),
       // A table with nothing usable in it: parses, prices nothing.
-      [DEFAULT_PRICE_TABLE_PATHNAME]: () => json({ sample_spec: { litellm_provider: 'none' } }),
+      [PRICE_TABLE_PATHNAME]: () => json({ sample_spec: { litellm_provider: 'none' } }),
     },
   )
   const all = [...logs, ...warns]
@@ -509,7 +513,7 @@ test('a fresh cache answers, without touching the network', async () => {
     {
       ...PROXY_ROUTES,
       // Reaching the price table at all on this path is the failure.
-      [DEFAULT_PRICE_TABLE_PATHNAME]: () => {
+      [PRICE_TABLE_PATHNAME]: () => {
         throw new Error('should not fetch when the cache is fresh')
       },
     },
@@ -524,7 +528,7 @@ test('a fresh cache answers, without touching the network', async () => {
   // Asserted, not merely arranged: the throwing route above proves nothing on
   // its own, because a background refresh swallows whatever it throws.
   assert.deepEqual(
-    fetchedURLs.filter((u) => u.includes(DEFAULT_PRICE_TABLE_PATHNAME)),
+    fetchedURLs.filter((u) => u.includes(PRICE_TABLE_PATHNAME)),
     [],
     'a fresh cache must not reach the price table at all',
   )
@@ -553,7 +557,7 @@ test('a cache written by an older schema is discarded, not half-read', async () 
   // price nothing from a newly read field.
   const { logs } = await runConfigHook(
     providerConfig('https://proxy-schema.test'),
-    { ...PROXY_ROUTES, [DEFAULT_PRICE_TABLE_PATHNAME]: () => json(PRICE_TABLE) },
+    { ...PROXY_ROUTES, [PRICE_TABLE_PATHNAME]: () => json(PRICE_TABLE) },
     { seed: { table: CACHED_TABLE, ageMs: ONE_HOUR, v: 0 } },
   )
 
@@ -564,7 +568,7 @@ test('a cache written by an older schema is discarded, not half-read', async () 
     `expected the stale-schema cache to be discarded, got: ${logs.join(' | ')}`,
   )
   assert.ok(
-    logs.some((l) => l.includes('catalog:') && l.includes(DEFAULT_PRICE_TABLE_URL)),
+    logs.some((l) => l.includes('catalog:') && l.includes(PRICE_TABLE_URL)),
     `expected the fetched table as source, got: ${logs.join(' | ')}`,
   )
 })
@@ -576,7 +580,7 @@ test('prices from the fetched price table, including the model parameters', asyn
     {
       '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
       '/model_group/info': () => json({ data: [] }),
-      [DEFAULT_PRICE_TABLE_PATHNAME]: () => json(PRICE_TABLE),
+      [PRICE_TABLE_PATHNAME]: () => json(PRICE_TABLE),
     },
   )
 
@@ -606,7 +610,7 @@ test('a price-table outage costs nothing once a cache exists', async () => {
     providerConfig(baseURL),
     {
       ...PROXY_ROUTES,
-      [DEFAULT_PRICE_TABLE_PATHNAME]: () => {
+      [PRICE_TABLE_PATHNAME]: () => {
         throw new Error('network down')
       },
     },
@@ -625,6 +629,57 @@ test('a price-table outage costs nothing once a cache exists', async () => {
   )
   // Nothing is wrong here, so nothing may warn.
   assert.equal(warns.length, 0, `expected no warnings, got: ${warns.join(' | ')}`)
+})
+
+// --- no options.pricingURL --------------------------------------------------
+//
+// There is no default table. A provider that names none is a configuration
+// gap, and the plugin says so rather than reaching for a hardcoded third-party
+// URL — but the models are still worth having, so discovery runs anyway.
+test('without options.pricingURL, models are injected unpriced and nothing is fetched', async () => {
+  const config = {
+    provider: {
+      [PROVIDER_KEY]: {
+        // Everything the README asks for EXCEPT the price table.
+        options: { baseURL: 'https://proxy-nopricingurl.test/v1', apiKey: 'sk-test' },
+      } as Record<string, unknown>,
+    },
+  }
+  const { logs, warns } = await runConfigHook(config, {
+    '/v1/models': () => modelsResponse(CHAT_MODEL),
+    '/model_group/info': () =>
+      json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
+    // Reaching ANY price table on this path is the failure.
+    [PRICE_TABLE_PATHNAME]: () => {
+      throw new Error('no table may be fetched when pricingURL is unset')
+    },
+  })
+
+  // The model is still discovered and injected — just without a cost block.
+  const entry = (config.provider[PROVIDER_KEY]!.models as Record<string, Record<string, unknown>>)[
+    'ai-gateway-gpt-5.4'
+  ]
+  assert.ok(entry, 'discovery must still run without a price table')
+  assert.equal(entry.name, 'AI Gateway GPT 5.4')
+  assert.equal(entry.cost, undefined, 'no table means no cost, never a guessed one')
+
+  // Named, actionable, and pointing at the option that fixes it.
+  assert.ok(
+    warns.some((l) => l.includes('has no options.pricingURL') && l.includes(PROVIDER_KEY)),
+    `expected a named warning about the missing option, got: ${warns.join(' | ')}`,
+  )
+  // Asserted rather than merely arranged: the throwing route above proves
+  // nothing on its own, since a background refresh swallows what it throws.
+  assert.deepEqual(
+    fetchedURLs.filter((u) => u.includes('model_prices_and_context_window')),
+    [],
+    'an unset pricingURL must not fall back to a hardcoded table',
+  )
+  // And the unpriced model is named, so the gap is diagnosable from the log.
+  assert.ok(
+    logs.some((l) => l.includes('no pricing: ai-gateway-gpt-5.4')),
+    `expected the unpriced model named, got: ${logs.join(' | ')}`,
+  )
 })
 
 // --- options.pricingURL -----------------------------------------------------
@@ -658,7 +713,7 @@ async function readCacheFile(url: string): Promise<{ table: Record<string, unkno
   return JSON.parse(await readFile(file, 'utf8')) as { table: Record<string, unknown> }
 }
 
-test('options.pricingURL is fetched instead of the default table', async () => {
+test('options.pricingURL is the only table fetched', async () => {
   const { result, logs } = await runConfigHook(
     providerConfig('https://proxy-custom.test', {
       options: { baseURL: 'https://proxy-custom.test', apiKey: 'sk-test', pricingURL: CUSTOM_PRICING_URL },
@@ -666,9 +721,9 @@ test('options.pricingURL is fetched instead of the default table', async () => {
     {
       ...PROXY_ROUTES,
       [CUSTOM_PRICING_PATHNAME]: () => json(ENRICHED_TABLE),
-      // The default table must not be consulted at all once a URL is set.
-      [DEFAULT_PRICE_TABLE_PATHNAME]: () => {
-        throw new Error('the default table must not be fetched when pricingURL is set')
+      // No other table may be consulted — the configured URL is the only one.
+      [PRICE_TABLE_PATHNAME]: () => {
+        throw new Error('only the configured pricingURL may be fetched')
       },
     },
   )
@@ -697,14 +752,14 @@ test('options.pricingURL is fetched instead of the default table', async () => {
     `expected the configured URL and an empty-provider note, got: ${logs.join(' | ')}`,
   )
   assert.deepEqual(
-    fetchedURLs.filter((u) => u.includes(DEFAULT_PRICE_TABLE_PATHNAME)),
+    fetchedURLs.filter((u) => u.includes(PRICE_TABLE_PATHNAME)),
     [],
-    'the default table must not be fetched when pricingURL is set',
+    'only the configured pricingURL may be fetched',
   )
 })
 
 test('the cache is keyed per price-table URL', async () => {
-  // A cache seeded for the DEFAULT url must never answer for a provider
+  // A cache seeded for one url must never answer for a provider
   // configured with a different one — otherwise switching tables, or running
   // two providers against two tables, silently serves the wrong prices.
   const { result } = await runConfigHook(
