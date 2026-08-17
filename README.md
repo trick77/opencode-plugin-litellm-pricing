@@ -25,7 +25,7 @@ Add the plugin and a LiteLLM provider to your `opencode.json`:
       "options": {
         "baseURL": "https://litellm.example.com/v1",
         "apiKey": "{env:LITELLM_API_KEY}",
-        "pricingURL": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+        "catalogURL": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
       }
     }
   }
@@ -39,7 +39,7 @@ The key is read from `options.apiKey`, else `$LITELLM_API_KEY` /
 
 ### The price table
 
-`options.pricingURL` is required for pricing and has **no default**: the plugin
+`options.catalogURL` is required for pricing and has **no default**: the plugin
 fetches the table you name and nothing else. A provider without one still gets
 its models discovered and injected — they just carry no cost, and the startup
 log says why.
@@ -47,7 +47,7 @@ log says why.
 LiteLLM's published [`model_prices_and_context_window.json`][litellm-prices]
 covers the public model line and is what the example above points at. If your
 gateway serves an enriched copy — the upstream entries plus your own model
-names, with their real context and pricing — point `pricingURL` at that
+names, with their real context and pricing — point `catalogURL` at that
 instead; those models then price by exact key rather than by substring against
 the public line. Same format either way: one flat JSON object keyed by model
 name, costs in USD per token. It is fetched once and cached — see
@@ -144,12 +144,12 @@ A healthy run:
 
 Coverage is counted over the models actually added. Unpriced models are named,
 not just counted. `pricing for 0/N` is logged as a warning — usually the catalog
-line above will say it was unavailable or empty, or that no `pricingURL` was
+line above will say it was unavailable or empty, or that no `catalogURL` was
 configured at all:
 
 ```
-[litellm-pricing] provider "litellm" has no options.pricingURL — set it to a
-  price table in LiteLLM `model_prices_and_context_window.json` format;
+[litellm-pricing] provider "litellm" has no options.catalogURL — set it to a
+  model catalog in LiteLLM `model_prices_and_context_window.json` format;
   every model will be injected without pricing.
 ```
 

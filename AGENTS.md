@@ -49,7 +49,7 @@ then `cd test/probe && opencode models`.
   `additionalProperties:false`. NEVER emit a nested `cache` object — the schema
   rejects it and the whole `cost` is dropped. Values are USD per 1M tokens.
 - ONE cost source: the configured price table, in LiteLLM
-  `model_prices_and_context_window.json` format (`options.pricingURL`, NO
+  `model_prices_and_context_window.json` format (`options.catalogURL`, NO
   default — unset means inject unpriced + warn). Costs are per-TOKEN — they MUST go through
   `buildCost`/`perMillion` (×1e6). Never source cost from the proxy —
   `/v1/model/info` needs an admin key, which a normal virtual key is not.

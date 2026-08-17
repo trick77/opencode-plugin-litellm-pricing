@@ -114,10 +114,10 @@ function providerConfig(baseURL: string, extra: Record<string, unknown> = {}) {
     provider: {
       [PROVIDER_KEY]: {
         // `npm` deliberately omitted — the plugin should default it.
-        // `pricingURL` spelled out because the plugin has no default: a
+        // `catalogURL` spelled out because the plugin has no default: a
         // provider without one is injected unpriced, which is its own scenario
         // below rather than the baseline every other scenario builds on.
-        options: { baseURL, apiKey: 'sk-test', pricingURL: PRICE_TABLE_URL },
+        options: { baseURL, apiKey: 'sk-test', catalogURL: PRICE_TABLE_URL },
         ...extra,
       } as Record<string, unknown>,
     },
@@ -233,7 +233,7 @@ test('the pre-rename provider id is still matched', async () => {
         options: {
           baseURL: 'https://proxy-legacy-id.test/v1',
           apiKey: 'sk-test',
-          pricingURL: PRICE_TABLE_URL,
+          catalogURL: PRICE_TABLE_URL,
         },
       } as Record<string, unknown>,
     },
@@ -631,17 +631,17 @@ test('a price-table outage costs nothing once a cache exists', async () => {
   assert.equal(warns.length, 0, `expected no warnings, got: ${warns.join(' | ')}`)
 })
 
-// --- no options.pricingURL --------------------------------------------------
+// --- no options.catalogURL --------------------------------------------------
 //
 // There is no default table. A provider that names none is a configuration
 // gap, and the plugin says so rather than reaching for a hardcoded third-party
 // URL — but the models are still worth having, so discovery runs anyway.
-test('without options.pricingURL, models are injected unpriced and nothing is fetched', async () => {
+test('without options.catalogURL, models are injected unpriced and nothing is fetched', async () => {
   const config = {
     provider: {
       [PROVIDER_KEY]: {
         // Everything the README asks for EXCEPT the price table.
-        options: { baseURL: 'https://proxy-nopricingurl.test/v1', apiKey: 'sk-test' },
+        options: { baseURL: 'https://proxy-nocatalogurl.test/v1', apiKey: 'sk-test' },
       } as Record<string, unknown>,
     },
   }
@@ -651,7 +651,7 @@ test('without options.pricingURL, models are injected unpriced and nothing is fe
       json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
     // Reaching ANY price table on this path is the failure.
     [PRICE_TABLE_PATHNAME]: () => {
-      throw new Error('no table may be fetched when pricingURL is unset')
+      throw new Error('no table may be fetched when catalogURL is unset')
     },
   })
 
@@ -665,7 +665,7 @@ test('without options.pricingURL, models are injected unpriced and nothing is fe
 
   // Named, actionable, and pointing at the option that fixes it.
   assert.ok(
-    warns.some((l) => l.includes('has no options.pricingURL') && l.includes(PROVIDER_KEY)),
+    warns.some((l) => l.includes('has no options.catalogURL') && l.includes(PROVIDER_KEY)),
     `expected a named warning about the missing option, got: ${warns.join(' | ')}`,
   )
   // Asserted rather than merely arranged: the throwing route above proves
@@ -673,7 +673,7 @@ test('without options.pricingURL, models are injected unpriced and nothing is fe
   assert.deepEqual(
     fetchedURLs.filter((u) => u.includes('model_prices_and_context_window')),
     [],
-    'an unset pricingURL must not fall back to a hardcoded table',
+    'an unset catalogURL must not fall back to a hardcoded table',
   )
   // And the unpriced model is named, so the gap is diagnosable from the log.
   assert.ok(
@@ -682,7 +682,50 @@ test('without options.pricingURL, models are injected unpriced and nothing is fe
   )
 })
 
-// --- options.pricingURL -----------------------------------------------------
+// A config still carrying the pre-0.7.0 spelling is the one case where "no
+// catalogURL" alone is misleading: the operator did name a table, under the old
+// key. The key is NOT read — a silent fallback would keep two spellings alive
+// forever — so the models arrive unpriced either way, and the warning names the
+// rename instead of leaving the cause to be guessed.
+test('a config carrying only the old pricingURL key is unpriced, and the warning names the rename', async () => {
+  const config = {
+    provider: {
+      [PROVIDER_KEY]: {
+        options: {
+          baseURL: 'https://proxy-legacykey.test/v1',
+          apiKey: 'sk-test',
+          pricingURL: 'https://catalog.example.com/model_prices_and_context_window.json',
+        },
+      } as Record<string, unknown>,
+    },
+  }
+  const { warns } = await runConfigHook(config, {
+    '/v1/models': () => modelsResponse(CHAT_MODEL),
+    '/model_group/info': () =>
+      json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
+    [PRICE_TABLE_PATHNAME]: () => {
+      throw new Error('the old key must not be read')
+    },
+  })
+
+  const entry = (config.provider[PROVIDER_KEY]!.models as Record<string, Record<string, unknown>>)[
+    'ai-gateway-gpt-5.4'
+  ]
+  assert.ok(entry, 'discovery must still run')
+  assert.equal(entry.cost, undefined, 'the old key must not be honoured as a fallback')
+  assert.ok(
+    warns.some((l) => l.includes('options.pricingURL') && l.includes('rename it to catalogURL')),
+    `expected the rename to be named, got: ${warns.join(' | ')}`,
+  )
+  // Nothing under the old name may be fetched either.
+  assert.deepEqual(
+    fetchedURLs.filter((u) => u.includes('model_prices_and_context_window')),
+    [],
+    'the old key must not be fetched from',
+  )
+})
+
+// --- options.catalogURL -----------------------------------------------------
 //
 // The whole point of the option: a proxy operator serves an enriched copy of
 // LiteLLM's table, carrying their own gateway model names, and those price by
@@ -713,17 +756,17 @@ async function readCacheFile(url: string): Promise<{ table: Record<string, unkno
   return JSON.parse(await readFile(file, 'utf8')) as { table: Record<string, unknown> }
 }
 
-test('options.pricingURL is the only table fetched', async () => {
+test('options.catalogURL is the only table fetched', async () => {
   const { result, logs } = await runConfigHook(
     providerConfig('https://proxy-custom.test', {
-      options: { baseURL: 'https://proxy-custom.test', apiKey: 'sk-test', pricingURL: CUSTOM_PRICING_URL },
+      options: { baseURL: 'https://proxy-custom.test', apiKey: 'sk-test', catalogURL: CUSTOM_PRICING_URL },
     }),
     {
       ...PROXY_ROUTES,
       [CUSTOM_PRICING_PATHNAME]: () => json(ENRICHED_TABLE),
       // No other table may be consulted — the configured URL is the only one.
       [PRICE_TABLE_PATHNAME]: () => {
-        throw new Error('only the configured pricingURL may be fetched')
+        throw new Error('only the configured catalogURL may be fetched')
       },
     },
   )
@@ -754,7 +797,7 @@ test('options.pricingURL is the only table fetched', async () => {
   assert.deepEqual(
     fetchedURLs.filter((u) => u.includes(PRICE_TABLE_PATHNAME)),
     [],
-    'only the configured pricingURL may be fetched',
+    'only the configured catalogURL may be fetched',
   )
 })
 
@@ -767,7 +810,7 @@ test('the cache is keyed per price-table URL', async () => {
       options: {
         baseURL: 'https://proxy-cachekey.test',
         apiKey: 'sk-test',
-        pricingURL: CUSTOM_PRICING_URL,
+        catalogURL: CUSTOM_PRICING_URL,
       },
     }),
     { ...PROXY_ROUTES, [CUSTOM_PRICING_PATHNAME]: () => json(ENRICHED_TABLE) },

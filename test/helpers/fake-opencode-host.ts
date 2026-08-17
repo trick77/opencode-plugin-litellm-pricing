@@ -101,7 +101,7 @@ export const PRICE_TABLE = {
 }
 
 /**
- * The price table the scenarios point `options.pricingURL` at. There is no
+ * The price table the scenarios point `options.catalogURL` at. There is no
  * default in the plugin — every provider names its own table — so this is just
  * the URL the suite happens to configure, served by the fake proxy below.
  */
