@@ -2,7 +2,7 @@
 //
 // Cost, context limits and capability flags come from a price table in
 // LiteLLM's `model_prices_and_context_window.json` format, matched to the
-// LiteLLM model by name. The URL comes from `options.pricingURL` and there is
+// LiteLLM model by name. The URL comes from `options.catalogURL` and there is
 // no default: the plugin fetches the table its operator names and nothing else.
 // LiteLLM's own published table is the obvious thing to point it at, but a
 // proxy operator can serve an enriched copy of the same file that also carries

@@ -14,7 +14,7 @@
 // `options.baseURL` is required. The plugin talks to that URL and nothing
 // else: there is no default and no port auto-detection.
 //
-// `options.pricingURL` is required for pricing, and has no default: point it
+// `options.catalogURL` is required for pricing, and has no default: point it
 // at a price table in LiteLLM's `model_prices_and_context_window.json` format.
 // LiteLLM's own published table is the obvious choice; an enriched copy — same
 // format, plus entries for your gateway's own model names — prices those models
@@ -32,7 +32,7 @@
 //         "options": {
 //           "baseURL": "https://litellm.example.com/v1",
 //           "apiKey": "{env:LITELLM_API_KEY}",
-//           "pricingURL": "https://catalog.example.com/model_prices_and_context_window.json"
+//           "catalogURL": "https://catalog.example.com/model_prices_and_context_window.json"
 //         }
 //       }
 //     }
@@ -125,7 +125,7 @@ function readCustomHeaders(options: Record<string, unknown>): Record<string, str
 
 export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
   // No catalog preload here. The price-table URL is per-provider config
-  // (`options.pricingURL`), and provider options do not exist until the
+  // (`options.catalogURL`), and provider options do not exist until the
   // `config` hook runs — so the table is loaded there, awaited before any model
   // is priced. That hook is invoked exactly ONCE (measured under both `serve`
   // and the CLI), so there is no later pass to fill prices in on, and the load
@@ -207,33 +207,42 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
         //
         // There is no default URL, for the same reason there is no default
         // baseURL: the plugin fetches what its operator named and nothing else.
-        // An unset pricingURL is a configuration gap to report, not a licence
+        // An unset catalogURL is a configuration gap to report, not a licence
         // to reach out to a hardcoded third-party host on every fresh install.
         // Discovery still runs — the models are worth having unpriced, and the
         // warning says exactly why they have no cost.
-        const pricingURL =
-          typeof options.pricingURL === 'string' && options.pricingURL
-            ? options.pricingURL
+        const catalogURL =
+          typeof options.catalogURL === 'string' && options.catalogURL
+            ? options.catalogURL
             : undefined
-        const catalog = pricingURL ? await getCatalog(pricingURL) : null
+        const catalog = catalogURL ? await getCatalog(catalogURL) : null
         const resolveCatalog = (name: string): CatalogFields | null =>
           catalog?.resolve(name) ?? null
 
-        if (!pricingURL) {
+        if (!catalogURL) {
           // Warned once per provider, not once per process: two providers can
           // be misconfigured independently, and naming the one that is missing
           // its table is the whole value of the message.
+          //
+          // `pricingURL` was this option's name up to 0.6.0. It is not read —
+          // renaming it and then quietly falling back would leave two live
+          // spellings forever — but a config still carrying only the old key
+          // is the one case where "no catalog URL" is misleading, so the
+          // message says which key to rename.
+          const hasLegacyKey =
+            typeof options.pricingURL === 'string' && options.pricingURL
           report(
             'warn',
-            `[litellm-pricing] provider "${providerId}" has no options.pricingURL — ` +
-              'set it to a price table in LiteLLM `model_prices_and_context_window.json` ' +
-              'format; every model will be injected without pricing.',
+            `[litellm-pricing] provider "${providerId}" has no options.catalogURL — ` +
+              'set it to a model catalog in LiteLLM `model_prices_and_context_window.json` ' +
+              'format; every model will be injected without pricing.' +
+              (hasLegacyKey ? ' Found options.pricingURL: rename it to catalogURL.' : ''),
           )
-        } else if (!reportedCatalogs.has(pricingURL)) {
+        } else if (!reportedCatalogs.has(catalogURL)) {
           // Once per price-table URL, not per provider: two providers sharing a
           // table share its one load, so a second report would only repeat it.
-          reportedCatalogs.add(pricingURL)
-          const status = getCatalogStatus(pricingURL)
+          reportedCatalogs.add(catalogURL)
+          const status = getCatalogStatus(catalogURL)
           // `ok` always carries a non-empty catalog — catalogFrom() returns null
           // at zero candidates, so a zero-candidate `ok` cannot be constructed.
           // `stale cache (refreshing)` is a success too, not a degraded state,
@@ -255,7 +264,7 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           } else {
             report(
               'warn',
-              `[litellm-pricing] price catalog unavailable from ${pricingURL} ` +
+              `[litellm-pricing] price catalog unavailable from ${catalogURL} ` +
                 `(${status.reason}) — every model will be injected without pricing.`,
             )
           }
