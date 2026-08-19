@@ -51,8 +51,8 @@ then `cd test/probe && opencode models`.
 - ONE cost source: the configured price table, in LiteLLM
   `model_prices_and_context_window.json` format (`options.catalogURL`, NO
   default — unset means inject unpriced + warn). Costs are per-TOKEN — they MUST go through
-  `buildCost`/`perMillion` (×1e6). Never source cost from the proxy —
-  `/v1/model/info` needs an admin key, which a normal virtual key is not.
+  `buildCost`/`perMillion` (×1e6). Never source cost from the proxy — its
+  numbers need `model_info.base_model` set right, else they silently bill $0.
 - NEVER await a fetch on the startup path once a cache exists. The `config`
   hook runs once, before anything renders, so a fetch there is a stall the user
   sits through. `load()` answers from cache (7d) → stale cache (background
@@ -99,14 +99,19 @@ then `cd test/probe && opencode models`.
 
 - `options.baseURL` is REQUIRED. No default URL, no port probing, never
   localhost. Missing → warn and skip the provider.
-- `/v1/models` carries NO `mode` (shape: `id/object/created/owned_by`). `mode`
-  comes from `/model_group/info`, keyed by `model_group` = the `/v1/models`
-  id. Best-effort, 3s budget: ANY failure falls back to the id heuristics in
-  `categorizeModel`. Never let it block, throw, or drop models — it is not
-  settled whether that endpoint needs an elevated key.
-- `mode` branch is an ALLOW-list (`chat`/`completion`/`responses`); any other
-  non-empty mode is non-chat. `null`/absent → fall through to heuristics.
-  LiteLLM really does emit `mode: null`.
+- `/v1/models` carries NO `mode` (shape: `id/object/created/owned_by`).
+- `categorizeModel` signal order: proxy `mode` → id heuristics (non-chat hits
+  only) → catalog `mode` → default chat. Heuristics before catalog: a catalog
+  match may be a SUBSTRING.
+- Proxy `mode`: `/model_group/info`, keyed by `model_group` = the `/v1/models`
+  id. Best-effort, 3s budget, ANY failure falls back; never block/throw/drop.
+  403s by DEFAULT for `key_type: "llm_api"` keys (`allowed_routes:
+  ["llm_api_routes"]`; this route is in `info_routes`). Not a misconfiguration.
+- Catalog `mode`: `KEEP_FIELDS` → `CatalogFields.mode`. Often the ONLY signal.
+  Classification input ONLY — `applyCatalogFields` must never copy it out.
+- Both sources go through `categorizeMode`, an ALLOW-list
+  (`chat`/`completion`/`responses`); any other non-empty mode is non-chat.
+  `null`/absent → next signal. LiteLLM really does emit `mode: null`.
 - Id heuristics stay narrow — a false positive HIDES a working chat model.
   Never match bare `nova` / `e5` / `gte` / `audio`.
 - Never overwrite a user-curated `provider.*.models` entry.

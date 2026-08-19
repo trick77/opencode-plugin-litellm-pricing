@@ -21,6 +21,11 @@
 // by exact name instead of by substring match against the public model line.
 // Without it, models are still discovered and injected, just unpriced.
 //
+// The table is also where each model's `mode` comes from — the field that keeps
+// embedders and image generators out of the picker. The proxy can supply it too
+// (/model_group/info), but LiteLLM closes that route to `key_type: "llm_api"`
+// keys, so on those the catalog is the only classification there is.
+//
 // Configure in opencode.json:
 //
 //   {
@@ -425,7 +430,16 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
               // models, so a group response with no usable entries classified
               // nothing, and claiming otherwise sends the reader down the
               // wrong path.
-              (groups?.size ? '' : ' [no /model_group/info — non-chat filtered by name only]'),
+              //
+              // Without the endpoint the catalog's own `mode` still classifies
+              // (see categorizeModel), so naming only the id heuristics would
+              // understate what ran — and understate how much a catalogURL is
+              // worth to someone whose key cannot read /model_group/info.
+              (groups?.size
+                ? ''
+                : catalog
+                  ? ' [no /model_group/info — non-chat filtered by catalog mode + name]'
+                  : ' [no /model_group/info and no catalog — non-chat filtered by name only]'),
           )
 
           // Name them: a count alone doesn't say which model will read as free.

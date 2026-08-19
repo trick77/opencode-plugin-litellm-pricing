@@ -327,6 +327,39 @@ test('discovery still works when /model_group/info is refused', async () => {
   )
 })
 
+// 6b — the whole point of reading `mode` from the catalog: a key that cannot
+// call /model_group/info still classifies correctly.
+test('the catalog mode hides a non-chat model the id heuristics cannot name', async () => {
+  const config = providerConfig('https://proxy-catalogmode.test/v1')
+  const { logs } = await runConfigHook(config, {
+    '/v1/models': () =>
+      modelsResponse(CHAT_MODEL, { id: 'ai-gateway-veo-3.1', object: 'model' }),
+    // The default for a `key_type: "llm_api"` key — LiteLLM gives it
+    // `allowed_routes: ["llm_api_routes"]`, and this route is not in that list.
+    '/model_group/info': () => json({ error: 'forbidden' }, 403),
+    [PRICE_TABLE_PATHNAME]: () =>
+      json({
+        ...PRICE_TABLE,
+        // An enriched table, carrying the gateway's own model name — the
+        // documented reason to point catalogURL at your own copy.
+        'ai-gateway-veo-3.1': { litellm_provider: 'azure', mode: 'video_generation' },
+      }),
+  })
+
+  const models = config.provider[PROVIDER_KEY]!.models as Record<string, unknown>
+  assert.ok(models['ai-gateway-gpt-5.4'], 'the chat model should still be injected')
+  // Nothing in `veo` says "video" to the id heuristics. Only the catalog knows.
+  assert.equal(
+    models['ai-gateway-veo-3.1'],
+    undefined,
+    'the video generator should have been filtered out by its catalog mode',
+  )
+  assert.ok(
+    logs.some((l) => l.includes('non-chat filtered by catalog mode + name')),
+    `expected the summary to credit the catalog, got: ${logs.join(' | ')}`,
+  )
+})
+
 // 7 — the guarantee the README makes about hand-curated entries.
 test('existing hand-curated model entries are never overwritten', async () => {
   const curated = { name: 'Hand Curated', cost: { input: 999, output: 999 } }

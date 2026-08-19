@@ -4,7 +4,11 @@
     "litellm": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "LiteLLM probe",
-      "options": { "baseURL": "http://127.0.0.1:7801/v1", "apiKey": "probe" }
+      "options": {
+        "baseURL": "http://127.0.0.1:7801/v1",
+        "apiKey": "probe",
+        "catalogURL": "http://127.0.0.1:7801/price-table.json"
+      }
     }
   }
 }

@@ -44,6 +44,13 @@ fetches the table you name and nothing else. A provider without one still gets
 its models discovered and injected — they just carry no cost, and the startup
 log says why.
 
+The table earns its keep twice. Besides cost, each entry carries LiteLLM's
+`mode` — `chat`, `embedding`, `image_generation`, and so on — which is what
+keeps embedders, rerankers and image generators out of the model picker. The
+proxy can answer that question too, via `/model_group/info`, but LiteLLM closes
+that route to any key created as `key_type: "llm_api"`. On such a key the
+catalog is the only classification the plugin has.
+
 LiteLLM's published [`model_prices_and_context_window.json`][litellm-prices]
 covers the public model line and is what the example above points at. If your
 gateway serves an enriched copy — the upstream entries plus your own model

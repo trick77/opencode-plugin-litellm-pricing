@@ -44,6 +44,12 @@ const SAMPLE_SPEC_KEY = 'sample_spec'
 
 /** The opencode-config fields we can source from a catalog model. */
 export interface CatalogFields {
+  /**
+   * LiteLLM's `mode` for this entry, verbatim. Feeds categorizeModel and is
+   * NEVER written into the opencode model entry — see applyCatalogFields,
+   * which deliberately does not copy it.
+   */
+  mode?: string
   cost?: CostBlock
   limit?: { context: number; output: number }
   reasoning?: boolean
@@ -171,7 +177,7 @@ const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
  * served forever as if complete. On a mismatch the cache is discarded and
  * refetched.
  */
-const CACHE_SCHEMA = 2
+const CACHE_SCHEMA = 3
 
 /**
  * The fields toCatalogFields and buildCost read, and nothing else. LiteLLM
@@ -182,6 +188,11 @@ const CACHE_SCHEMA = 2
  */
 const KEEP_FIELDS = [
   'litellm_provider',
+  // Classification input, not an output field: `mode` says whether an entry is
+  // a chat model, an embedder, an image generator. It is the same field
+  // /model_group/info carries, from a source that needs no key — see
+  // categorizeModel.
+  'mode',
   'max_input_tokens',
   'max_output_tokens',
   'max_tokens',
@@ -406,6 +417,15 @@ async function load(url: string): Promise<{ catalog: Catalog | null; status: Cat
 }
 
 /**
+ * Does this entry carry anything the exact-key branch should win on?
+ *
+ * `mode` is excluded deliberately — see the comment in `resolve`.
+ */
+function hasFieldsBeyondMode(fields: CatalogFields): boolean {
+  return Object.keys(fields).some((k) => k !== 'mode')
+}
+
+/**
  * Build a name resolver from a LiteLLM-format price table. Pure and exported
  * for testing.
  *
@@ -461,11 +481,22 @@ export function buildFromTable(table: Record<string, unknown>): Catalog {
       // enriched table whose entry has `litellm_provider` and mistyped cost
       // keys reaches here as {}; returning it would swallow the substring pass
       // that could still have priced the model.
-      if (direct && Object.keys(direct).length > 0) return direct
+      //
+      // `mode` does NOT count as carrying something. Nearly every published
+      // entry has one (3045 of 3054 upstream), so counting it would make the
+      // check above fire on entries that classify a model without pricing it —
+      // silently unpricing every model the substring pass used to reach.
+      if (direct && hasFieldsBeyondMode(direct)) return direct
+      // The exact entry still had the better `mode`: an exact key cannot match
+      // the wrong model, whereas the substring below may have matched a
+      // relative. Overlay it rather than discarding it with the entry.
+      const mode = direct?.mode
       for (const c of candidates) {
-        if (isBoundedSubstring(norm, c.id)) return c.fields
+        if (isBoundedSubstring(norm, c.id)) return mode ? { ...c.fields, mode } : c.fields
       }
-      return null
+      // Classification with no price is still worth returning — it is what
+      // keeps an unpriced embedder out of the picker.
+      return mode ? { mode } : null
     },
   }
 }
@@ -518,6 +549,10 @@ function num(v: unknown): number | undefined {
  */
 export function toCatalogFields(entry: Record<string, unknown>): CatalogFields {
   const fields: CatalogFields = {}
+
+  // Empty string is not a mode. LiteLLM writes `null` for entries it has no
+  // classification for, and both mean "no signal" — not "not a chat model".
+  if (typeof entry.mode === 'string' && entry.mode) fields.mode = entry.mode
 
   const cost = buildCost(entry as LiteLLMModelInfo)
   if (cost && !isAllZero(cost)) fields.cost = cost

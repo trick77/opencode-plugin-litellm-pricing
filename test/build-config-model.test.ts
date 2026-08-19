@@ -195,3 +195,22 @@ test('chat model carries name, limit, cost, and capability flags', () => {
   assert.equal(entry.reasoning, true)
   assert.equal(entry.attachment, true)
 })
+
+test('a catalog mode hides a non-chat model that has no cost of its own', () => {
+  // Entries like this carry a mode and little else — which is precisely enough
+  // to keep a video generator out of the model picker.
+  const model: LiteLLMModel = { id: 'gemini/veo-3.1-generate-preview', object: 'model' }
+  assert.equal(configModelFromCatalog(model, { mode: 'video_generation' }), null)
+})
+
+test('mode is classification input and never reaches the emitted entry', () => {
+  // opencode’s model schema has no `mode`; leaking it would put an unknown key
+  // into the user’s provider config.
+  const model: LiteLLMModel = { id: 'ai-gateway-gpt-5.4', object: 'model' }
+  const entry = configModelFromCatalog(model, {
+    mode: 'chat',
+    cost: { input: 1, output: 2 },
+  })!
+  assert.equal('mode' in entry, false)
+  assert.deepEqual(entry.cost, { input: 1, output: 2 })
+})

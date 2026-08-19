@@ -148,7 +148,9 @@ export function configModelFromCatalog(
   model: LiteLLMModel,
   fields: CatalogFields | null,
 ): Record<string, unknown> | null {
-  if (categorizeModel(model) !== 'chat') return null
+  // The catalog's `mode` is classification input only — it must never reach the
+  // emitted entry, which is why applyCatalogFields below does not copy it.
+  if (categorizeModel(model, fields?.mode) !== 'chat') return null
 
   const entry: Record<string, unknown> = { name: formatModelName(model) }
 
