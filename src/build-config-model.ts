@@ -134,12 +134,15 @@ export function enrichModel(model: LiteLLMModel, info: LiteLLMModelInfo): LiteLL
  * rerank/moderation) so non-chat models don't clutter the picker.
  *
  * `model` should already carry whatever `/model_group/info` returned (apply it
- * with `enrichModel` first), so `categorizeModel` can classify on LiteLLM's own
- * `mode` and fall back to the id heuristic only when there isn't one.
+ * with `enrichModel` first), so `categorizeModel` can classify on the proxy's
+ * own `mode` first, then the id heuristics, then `fields.mode` — the catalog's
+ * classification, which is the only one a key that cannot read
+ * /model_group/info has.
  *
  * LiteLLM's limits and capability flags win where present; `fields` (matched
- * from the price-table catalog) supply cost and fill the remaining gaps, and
- * may be null when nothing matched — the model is still injected, just barer.
+ * from the price-table catalog) supply the classification above plus cost, and
+ * fill the remaining gaps; they may be null when nothing matched — the model is
+ * still injected, just barer.
  * Cost is never sourced from the proxy: LiteLLM's per-model numbers depend on
  * the deployment setting `base_model` correctly, and getting that wrong bills
  * $0 silently.
