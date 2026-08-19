@@ -4,15 +4,43 @@ import type { LiteLLMModel, ModelType } from './types.ts'
 import { LITELLM_CHAT_MODES } from './types.ts'
 
 /**
- * Classify a model so non-chat models (embedding, image, audio, rerank,
- * moderation, search) can be filtered out of the picker. Prefers LiteLLM's
- * `mode` (authoritative), falling back to conservative id heuristics only
- * when `mode` is absent or null.
+ * Map a LiteLLM `mode` string to a ModelType.
  *
- * The mode branch is an ALLOW-list, not a deny-list: any non-empty mode that
- * isn't a chat mode is non-chat, including values this file has never heard
- * of. A deny-list silently let new modes (`search`, `image_edit`, …) through
- * as chat models.
+ * An ALLOW-list, not a deny-list: any non-empty mode that isn't a chat mode is
+ * non-chat, including values this file has never heard of. A deny-list
+ * silently let new modes (`search`, `image_edit`, …) through as chat models.
+ *
+ * Shared by both mode sources — the proxy's and the catalog's — so the two can
+ * never drift into classifying the same string differently.
+ */
+function categorizeMode(rawMode: string): ModelType {
+  const mode = rawMode.toLowerCase()
+  if (LITELLM_CHAT_MODES.has(mode)) return 'chat'
+  if (mode === 'embedding') return 'embedding'
+  if (mode === 'image_generation') return 'image'
+  if (mode === 'audio_transcription' || mode === 'audio_speech') return 'audio'
+  // rerank / moderation / search / ocr / video_generation / anything
+  // unrecognised → not chat
+  return 'unknown'
+}
+
+/**
+ * Classify a model so non-chat models (embedding, image, audio, rerank,
+ * moderation, search) can be filtered out of the picker.
+ *
+ * Three signals, in descending order of authority:
+ *
+ * 1. `model.mode` — the proxy's own answer, via /model_group/info. Absent
+ *    whenever that endpoint is unreadable, which is the DEFAULT for a key
+ *    created with `key_type: "llm_api"`: LiteLLM gives such keys
+ *    `allowed_routes: ["llm_api_routes"]`, and /model_group/info sits in
+ *    `info_routes`. So this signal is missing on a great many proxies.
+ * 2. The id heuristics — narrow, high-precision, and therefore ahead of the
+ *    catalog, whose name match may be a substring rather than an exact key.
+ * 3. `catalogMode` — the `mode` field of the matched price-table entry. Needs
+ *    no key at all, and covers the non-chat models the heuristics cannot name:
+ *    image/video generators, OCR, search and realtime endpoints whose ids
+ *    carry no recognisable keyword.
  *
  * The id heuristics are deliberately narrow: a false positive HIDES a
  * usable chat model, which is worse than showing a stray non-chat one. So
@@ -21,18 +49,10 @@ import { LITELLM_CHAT_MODES } from './types.ts'
  * `gpt-4o-audio-preview`). Deliberately NOT matched for the same reason:
  * bare `nova` (`amazon.nova-pro-v1` is a chat model), `e5`, `gte`.
  */
-export function categorizeModel(model: LiteLLMModel): ModelType {
-  const mode = model.mode?.toLowerCase()
+export function categorizeModel(model: LiteLLMModel, catalogMode?: string): ModelType {
   // `mode` is absent on /v1/models and null for models LiteLLM has no
   // price-map entry for; both mean "no signal", not "not a chat model".
-  if (mode) {
-    if (LITELLM_CHAT_MODES.has(mode)) return 'chat'
-    if (mode === 'embedding') return 'embedding'
-    if (mode === 'image_generation') return 'image'
-    if (mode === 'audio_transcription' || mode === 'audio_speech') return 'audio'
-    // rerank / moderation / search / anything unrecognised → not chat
-    return 'unknown'
-  }
+  if (model.mode) return categorizeMode(model.mode)
 
   // Token boundaries include `.`: Bedrock/Vertex ids are dot-separated
   // (`stability.sd3-large-v1:0`, `amazon.titan-embed-text-v2`), so a class of
@@ -60,6 +80,12 @@ export function categorizeModel(model: LiteLLMModel): ModelType {
   ) {
     return 'image'
   }
+
+  // Nothing in the id said non-chat. The catalog is the last real signal
+  // before the default — and the only one that survives a key which cannot
+  // read /model_group/info.
+  if (catalogMode) return categorizeMode(catalogMode)
+
   return 'chat'
 }
 

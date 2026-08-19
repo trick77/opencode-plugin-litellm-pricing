@@ -125,7 +125,7 @@ export async function seedCache(
   url: string,
   table: unknown,
   ageMs: number,
-  v = 2,
+  v = 3,
 ): Promise<void> {
   const dir = join(process.env.XDG_CACHE_HOME!, 'opencode-plugin-litellm-pricing')
   await mkdir(dir, { recursive: true })

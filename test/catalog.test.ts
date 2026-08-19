@@ -222,3 +222,66 @@ test('max_tokens stands in for a missing max_output_tokens', () => {
   }).resolve('azure/legacy')!
   assert.deepEqual(fields.limit, { context: 128000, output: 4096 })
 })
+
+test('mode maps through, so a keyless proxy can still classify', () => {
+  // /model_group/info is closed to `key_type: "llm_api"` keys, so for many
+  // proxies this is the only place `mode` can come from.
+  const table = {
+    'azure/gpt-5.4': {
+      litellm_provider: 'azure',
+      mode: 'chat',
+      input_cost_per_token: 0.000001,
+      output_cost_per_token: 0.000002,
+    },
+    'azure/veo-3.1': { litellm_provider: 'azure', mode: 'video_generation' },
+    'azure/unclassified': { litellm_provider: 'azure', mode: null },
+  }
+  const resolver = buildFromTable(table)
+  assert.equal(resolver.resolve('azure/gpt-5.4')?.mode, 'chat')
+  assert.equal(resolver.resolve('azure/veo-3.1')?.mode, 'video_generation')
+  // `null` is LiteLLM for "no classification" — no signal, not a verdict.
+  assert.equal(resolver.resolve('azure/unclassified')?.mode, undefined)
+})
+
+test('an exact key carrying only a mode does not swallow the substring pass', () => {
+  // The regression this guards: nearly every published entry has a `mode`, so
+  // treating mode as "the exact entry carries something" would unprice every
+  // model that used to reach a price through the substring match.
+  const resolver = buildFromTable({
+    'azure/gpt-5.4': {
+      litellm_provider: 'azure',
+      mode: 'chat',
+      input_cost_per_token: 0.000001,
+      output_cost_per_token: 0.000002,
+    },
+    // An enriched table annotating the gateway name, but not pricing it.
+    'ai-gateway-gpt-5.4': { litellm_provider: 'ai-gateway', mode: 'chat' },
+  })
+  const fields = resolver.resolve('ai-gateway-gpt-5.4')
+  assert.equal(fields?.cost?.input, 1, 'the substring pass should still have priced it')
+  assert.equal(fields?.mode, 'chat')
+})
+
+test("an exact entry's mode overrides the substring match's", () => {
+  // The exact key cannot have matched the wrong model; the substring may have
+  // matched a relative, so the exact classification is the better one.
+  const resolver = buildFromTable({
+    'azure/gpt-5.4': {
+      litellm_provider: 'azure',
+      mode: 'chat',
+      input_cost_per_token: 0.000001,
+      output_cost_per_token: 0.000002,
+    },
+    'ai-gateway-gpt-5.4-embed': { litellm_provider: 'ai-gateway', mode: 'embedding' },
+  })
+  assert.equal(resolver.resolve('ai-gateway-gpt-5.4-embed')?.mode, 'embedding')
+})
+
+test('a mode-only entry with no substring match still classifies', () => {
+  // No price to be had, but keeping an embedder out of the picker does not
+  // depend on knowing what it costs.
+  const resolver = buildFromTable({
+    'acme/private-embedder': { litellm_provider: 'acme', mode: 'embedding' },
+  })
+  assert.deepEqual(resolver.resolve('acme/private-embedder'), { mode: 'embedding' })
+})
