@@ -414,37 +414,25 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           // reach the picker, so they can't bill anything and aren't a pricing
           // problem. `added > 0 && priced === 0` is the systematic-failure
           // shape, so it warns rather than informs.
+          //
+          // Counts only, on one short line. `hidden` folds every reason a
+          // discovered model did not get injected: the per-reason breakdown,
+          // the baseURL and the /model_group/info fallback marker all read as
+          // problems on a run where nothing is wrong. The URL is in the user's
+          // own config, and the discovery-failure warning above already names
+          // the host that did not answer. The one fallback worth acting on —
+          // no catalog at all — likewise has its own warning above; falling
+          // back to the id heuristics for `mode` is normal operation and is
+          // not worth a line.
+          const hidden = skipped + wildcards + preexisting + reinjected + malformed
           report(
             added > 0 && priced === 0 ? 'warn' : 'info',
-            `[litellm-pricing] provider "${providerId}": ${discovered.length} discovered, ` +
-              `${added} added, pricing for ${priced}/${added}` +
-              ` (${skipped} non-chat hidden` +
-              (wildcards > 0 ? `, ${wildcards} wildcard ignored` : '') +
-              (preexisting > 0 ? `, ${preexisting} already present` : '') +
-              (reinjected > 0 ? `, ${reinjected} already injected` : '') +
-              (malformed > 0 ? `, ${malformed} malformed` : '') +
-              `) from ${baseURL}` +
-              // Say which signal did the filtering, so an unexpected model in
-              // the picker is diagnosable without instrumenting the plugin.
-              // An empty map counts as "did not run": /v1/models returned
-              // models, so a group response with no usable entries classified
-              // nothing, and claiming otherwise sends the reader down the
-              // wrong path.
-              //
-              // Without the endpoint the catalog's own `mode` still classifies
-              // (see categorizeModel), so naming only the id heuristics would
-              // understate what ran — and understate how much a catalogURL is
-              // worth to someone whose key cannot read /model_group/info.
-              (groups?.size
-                ? ''
-                : catalog
-                  ? ' [no /model_group/info — non-chat filtered by catalog mode + name]'
-                  : ' [no /model_group/info and no catalog — non-chat filtered by name only]'),
+            `[litellm-pricing] ${providerId}: ${added} models, ${priced} priced, ${hidden} hidden`,
           )
 
           // Name them: a count alone doesn't say which model will read as free.
-          // Capped so a large proxy stays readable — the true total is already
-          // in the fraction above.
+          // Capped so a large proxy stays readable — the summary line above
+          // already carries the true priced/unpriced split.
           if (unpricedIds.length > 0) {
             const shown = unpricedIds.slice(0, UNPRICED_LIST_LIMIT)
             const rest = unpricedIds.length - shown.length

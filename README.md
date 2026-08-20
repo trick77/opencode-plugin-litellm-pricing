@@ -144,15 +144,16 @@ A healthy run:
 
 ```
 [litellm-pricing] catalog: 3001 model(s) from cache — substring match via azure, openai
-[litellm-pricing] provider "litellm": 41 discovered, 34 added, pricing for 31/34
-  (5 non-chat hidden, 2 wildcard ignored) from https://litellm.example.com
+[litellm-pricing] litellm: 34 models, 31 priced, 7 hidden
 [litellm-pricing]   no pricing: my-finetune-v2, internal-router, … +1 more
 ```
 
-Coverage is counted over the models actually added. Unpriced models are named,
-not just counted. `pricing for 0/N` is logged as a warning — usually the catalog
-line above will say it was unavailable or empty, or that no `catalogURL` was
-configured at all:
+`34 models` is what reached the picker, `31 priced` how many of those carry
+cost, and `7 hidden` everything the proxy offered that was not injected —
+non-chat models, wildcard access rules, and ids already in your config.
+Unpriced models are named, not just counted. `N models, 0 priced` is logged as a
+warning — usually the catalog line above will say it was unavailable or empty,
+or that no `catalogURL` was configured at all:
 
 ```
 [litellm-pricing] provider "litellm" has no options.catalogURL — set it to a
