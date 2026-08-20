@@ -196,7 +196,7 @@ test('injects discovered models with catalog pricing into the config', async () 
   assert.equal(entry.tool_call, true)
 
   assert.ok(
-    logs.some((l) => l.includes('1 discovered, 1 added, pricing for 1/1')),
+    logs.some((l) => l.includes('1 models, 1 priced, 0 hidden')),
     `expected a priced summary, got: ${logs.join(' | ')}`,
   )
 })
@@ -220,7 +220,7 @@ test('non-chat models are filtered out by /model_group/info mode', async () => {
   const models = config.provider[PROVIDER_KEY]!.models as Record<string, unknown>
   assert.ok(models['ai-gateway-gpt-5.4'], 'the chat model should survive')
   assert.equal(models['house-vectorizer'], undefined, 'the embedding model should be hidden')
-  assert.ok(logs.some((l) => l.includes('1 non-chat hidden')))
+  assert.ok(logs.some((l) => l.includes('1 models, 1 priced, 1 hidden')))
 })
 
 // 3b — the rename compatibility guarantee. `provider` keys live in the user's
@@ -321,9 +321,15 @@ test('discovery still works when /model_group/info is refused', async () => {
   assert.ok(models['ai-gateway-gpt-5.4'], 'the chat model should still be injected')
   // No `mode` available, so this one is caught by the id heuristics instead.
   assert.equal(models['ai-gateway-text-embedding-3-small'], undefined)
+  // The refusal is not reported: the id heuristics are a normal fallback,
+  // and the summary still accounts for the model it hid.
   assert.ok(
-    logs.some((l) => l.includes('[no /model_group/info')),
-    `expected the degraded-path marker, got: ${logs.join(' | ')}`,
+    logs.some((l) => l.includes('1 models, 1 priced, 1 hidden')),
+    `expected the model still summarised, got: ${logs.join(' | ')}`,
+  )
+  assert.ok(
+    !logs.some((l) => l.includes('model_group')),
+    `the refused capability lookup should not be reported: ${logs.join(' | ')}`,
   )
 })
 
@@ -354,9 +360,11 @@ test('the catalog mode hides a non-chat model the id heuristics cannot name', as
     undefined,
     'the video generator should have been filtered out by its catalog mode',
   )
+  // The filtering is not narrated — the model simply does not appear, and the
+  // summary counts it as hidden.
   assert.ok(
-    logs.some((l) => l.includes('non-chat filtered by catalog mode + name')),
-    `expected the summary to credit the catalog, got: ${logs.join(' | ')}`,
+    logs.some((l) => l.includes('1 models, 1 priced, 1 hidden')),
+    `expected the hidden model counted, got: ${logs.join(' | ')}`,
   )
 })
 
@@ -377,7 +385,7 @@ test('existing hand-curated model entries are never overwritten', async () => {
   // discovery never ran. The summary line proves the model WAS discovered and
   // then deliberately skipped.
   assert.ok(
-    logs.some((l) => l.includes('1 discovered, 0 added') && l.includes('1 already present')),
+    logs.some((l) => l.includes('0 models, 0 priced, 1 hidden')),
     `expected discovery to have run and added nothing, got: ${logs.join(' | ')}`,
   )
 })
@@ -406,18 +414,15 @@ test('the summary accounts for every discovered model, and names the unpriced', 
   const all = [...logs, ...warns]
 
   // 4 discovered = 2 added + 1 non-chat + 1 wildcard, and of the 2 added only
-  // ai-gateway-gpt-5.4 has a catalog match.
+  // ai-gateway-gpt-5.4 has a catalog match. Both non-added reasons fold into
+  // `hidden`, so the counts still add up to everything discovered.
   assert.ok(
-    all.some((l) => l.includes('4 discovered, 2 added')),
+    all.some((l) => l.includes('2 models, 1 priced, 2 hidden')),
     `expected an accounted summary, got: ${all.join(' | ')}`,
   )
   assert.ok(
     all.some((l) => l.includes('no pricing: some-unknown-llama-thing')),
     `expected the unpriced model named, got: ${all.join(' | ')}`,
-  )
-  assert.ok(
-    all.some((l) => l.includes('1 non-chat hidden') && l.includes('1 wildcard ignored')),
-    `expected the non-chat and wildcard clauses, got: ${all.join(' | ')}`,
   )
 })
 
@@ -484,7 +489,7 @@ test('with no table at all, the failure is reported rather than shown as $0', as
   )
   // added > 0 with priced === 0 is the systematic-failure shape, so it warns.
   assert.ok(
-    warns.some((l) => l.includes('pricing for 0/2')),
+    warns.some((l) => l.includes('2 models, 0 priced')),
     `expected the zero-coverage summary to warn, got: ${all.join(' | ')}`,
   )
 })
@@ -948,18 +953,18 @@ test('models we injected stay ours across repeated config passes', async () => {
     { rerun: [dropOne, dropOne] },
   )
 
-  const summaries = logs.filter((l) => l.includes('discovered,'))
+  const summaries = logs.filter((l) => l.includes(' models, '))
   assert.equal(summaries.length, 3, `expected three summaries, got: ${logs.join(' | ')}`)
-  // Passes 2 and 3 both re-add the dropped id and re-encounter `house-chat`,
-  // which we injected on pass 1. It must never be reported as the user's.
+  // Passes 2 and 3 each re-add the dropped id and re-encounter `house-chat`,
+  // which we injected on pass 1 — one added, one hidden, every pass.
   for (const [i, summary] of summaries.slice(1).entries()) {
     assert.ok(
-      summary.includes('1 already injected'),
-      `pass ${i + 2} should recognise its own entry: ${summary}`,
-    )
-    assert.ok(
-      !summary.includes('already present'),
-      `pass ${i + 2} credited the user with our entry: ${summary}`,
+      summary.includes('1 models, 1 priced, 1 hidden'),
+      `pass ${i + 2} should re-add exactly the dropped id: ${summary}`,
     )
   }
+  // Both ids are present at the end: the re-entry restored the dropped one
+  // without disturbing the one it had already injected.
+  assert.ok(models()['ai-gateway-gpt-5.4'], 'the dropped id was not re-added')
+  assert.ok(models()['house-chat'], 'the surviving id was lost')
 })
