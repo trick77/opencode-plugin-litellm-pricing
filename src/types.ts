@@ -1,14 +1,17 @@
 // Core types for the opencode-plugin-litellm-pricing plugin.
 //
 // Models the subset of LiteLLM's OpenAI-compatible /v1/models and
-// /model_group/info payloads the plugin needs, plus the price-map entry shape
-// the cost fields for opencode's per-model `cost` block are read from.
+// /v1/model/info payloads the plugin needs — including the price-map entry
+// shape the cost fields for opencode's per-model `cost` block are read from.
 
 /**
  * A single model entry returned by LiteLLM's `/v1/models` endpoint.
- * LiteLLM follows the OpenAI-compatible schema; the capability/limit fields
- * below are LiteLLM-specific extensions that `/v1/models` does not carry —
- * `enrichModel` overlays them from `/model_group/info`.
+ *
+ * LiteLLM follows the OpenAI-compatible schema and adds a few fields of its
+ * own. Current LiteLLM emits `mode`, `max_input_tokens` and `max_output_tokens`
+ * here (see `create_model_info_response` in litellm/proxy/utils.py); older
+ * proxies return `{id, object, created, owned_by}` alone. It never carries
+ * cost. Everything missing is overlaid from `/v1/model/info` by `enrichModel`.
  */
 export interface LiteLLMModel {
   id: string
@@ -19,8 +22,8 @@ export interface LiteLLMModel {
   litellm_provider?: string
   /**
    * LiteLLM `mode` — see {@link LITELLM_CHAT_MODES} for the documented values.
-   * NOT returned by `/v1/models`: its documented response shape is
-   * `{id, object, created, owned_by}`. Present via `/model_group/info`.
+   * Emitted by `/v1/models` on current LiteLLM, absent on older proxies; also
+   * carried by every `/v1/model/info` entry.
    */
   mode?: string
   max_tokens?: number
@@ -43,10 +46,10 @@ export interface LiteLLMModelsResponse {
  * the reason this plugin exists — per-token cost fields.
  *
  * Field names follow LiteLLM's `model_prices_and_context_window.json`, which
- * is both the format of the price table the catalog reads and the shape of
- * the `model_info` block LiteLLM's own endpoints return. Cost values are USD
- * **per token**; opencode expects USD **per 1,000,000 tokens**, so the cost
- * mapper scales them by 1e6.
+ * is exactly the shape of the `model_info` block `/v1/model/info` returns —
+ * the proxy resolves the entry itself and merges any config-level overrides
+ * on top. Cost values are USD **per token**; opencode expects USD **per
+ * 1,000,000 tokens**, so the cost mapper scales them by 1e6.
  *
  * Two readers: `buildCost` (the cost fields) and `enrichModel` (everything
  * else, overlaid onto a lean `/v1/models` entry).
@@ -76,35 +79,23 @@ export interface LiteLLMModelInfo {
 }
 
 /**
- * A single entry returned by LiteLLM's `/model_group/info` endpoint.
+ * A single row of LiteLLM's `/v1/model/info` response.
  *
- * Keyed by `model_group`, which is the same string `/v1/models` reports as a
- * model `id` — so unlike `/v1/model/info` no alias resolution is needed. This
- * is the plugin's source for `mode` (what kind of model it is) and for the
- * capability flags. The endpoint also returns per-token cost fields; they are
- * deliberately not declared here and never read — pricing comes from the
- * price-table catalog by policy, because LiteLLM's own numbers silently become
- * $0 when a deployment's `base_model` is misconfigured.
+ * One row per **deployment**, not per model group, so several rows can share a
+ * `model_name` — that string is the public model-group name, which is exactly
+ * the id `/v1/models` reports, so no alias resolution is needed.
  *
- * `mode` may legitimately be `null` — LiteLLM emits that for models it has no
- * price-map entry for — which is why classification falls back to the id
- * heuristics per model rather than all-or-nothing.
+ * `litellm_params` and the rest of the deployment record are returned too (with
+ * credentials stripped by the proxy) and deliberately not declared: the plugin
+ * reads `model_name` and `model_info` and nothing else.
  */
-export interface LiteLLMModelGroupInfo {
-  model_group: string
-  providers?: string[]
-  mode?: string | null
-  max_input_tokens?: number | null
-  max_output_tokens?: number | null
-  supports_function_calling?: boolean
-  supports_vision?: boolean
-  supports_reasoning?: boolean
-  supports_pdf_input?: boolean
-  supports_audio_input?: boolean
+export interface LiteLLMModelInfoEntry {
+  model_name?: string
+  model_info?: LiteLLMModelInfo
 }
 
-export interface LiteLLMModelGroupResponse {
-  data?: LiteLLMModelGroupInfo[]
+export interface LiteLLMModelInfoResponse {
+  data?: LiteLLMModelInfoEntry[]
 }
 
 /**
@@ -141,7 +132,10 @@ export interface CostBlock extends CostTier {
   context_over_200k?: CostTier
 }
 
-/** Options accepted on a matched LiteLLM provider's `options` block. */
+/**
+ * Options accepted on a matched LiteLLM provider's `options` block. `baseURL`
+ * is the only required one — pricing comes from the proxy it names.
+ */
 export interface LiteLLMOptions {
   baseURL?: string
   apiKey?: string

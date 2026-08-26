@@ -127,15 +127,15 @@ test('an explicit chat mode overrides a non-chat-looking id', () => {
   assert.equal(categorizeModel(m('acme-embed-chat', 'chat')), 'chat')
 })
 
-// --- catalog mode: the keyless third signal ---------------------------------
+// --- the modes only the proxy can name --------------------------------------
 //
-// The proxy's `mode` arrives from /model_group/info, which LiteLLM closes to
-// any key created as `key_type: "llm_api"`. The catalog's `mode` needs no key,
-// so on those proxies it is the ONLY real classification signal there is.
+// `mode` reaches the model from /v1/models (LiteLLM v1.96.0+) or from the
+// /v1/model/info block overlaid by enrichModel. Either way it is the only
+// signal that can name a non-chat model whose id carries no keyword.
 
-test('a catalog mode hides a non-chat model whose id says nothing', () => {
-  // The gap this signal exists to close: no keyword in the id, no proxy mode,
-  // so before the catalog these reached the picker as chat models.
+test('a proxy mode hides a non-chat model whose id says nothing', () => {
+  // The gap this signal exists to close: no keyword in the id, so without
+  // `mode` these reach the picker as chat models.
   const cases: Array<[string, string, ModelType]> = [
     ['gemini/veo-3.1-generate-preview', 'video_generation', 'unknown'],
     ['azure_ai/mistral-document-ai-2505', 'ocr', 'unknown'],
@@ -145,36 +145,22 @@ test('a catalog mode hides a non-chat model whose id says nothing', () => {
     ['amazon.nova-canvas-v1:0', 'image_generation', 'image'],
     ['databricks/databricks-gte-large-en', 'embedding', 'embedding'],
   ]
-  for (const [id, catalogMode, expected] of cases) {
-    assert.equal(categorizeModel(m(id), catalogMode), expected, id)
+  for (const [id, mode, expected] of cases) {
+    assert.equal(categorizeModel(m(id, mode)), expected, id)
   }
 })
 
-test('catalog chat modes keep a model visible', () => {
+test('every chat mode keeps a model visible', () => {
   // `responses` and `completion` are chat modes. Reading them as non-chat would
   // hide the o1-pro/codex family — a far worse failure than the one being fixed.
   for (const mode of ['chat', 'completion', 'responses']) {
-    assert.equal(categorizeModel(m('acme-gateway-model'), mode), 'chat', mode)
+    assert.equal(categorizeModel(m('acme-gateway-model', mode)), 'chat', mode)
   }
 })
 
-test('the proxy mode wins over a conflicting catalog mode', () => {
-  // The proxy knows what it actually deployed; the catalog matched a name.
-  assert.equal(categorizeModel(m('acme-model', 'chat'), 'embedding'), 'chat')
-  assert.equal(categorizeModel(m('acme-model', 'embedding'), 'chat'), 'embedding')
-})
-
-test('a non-chat id beats a catalog claiming chat', () => {
-  // The catalog match may be a SUBSTRING, so `acme-embed-v1` can resolve to a
-  // chat entry it merely contains. The id heuristics are the narrower signal
-  // and stay ahead of it.
-  assert.equal(categorizeModel(m('acme-embed-v1'), 'chat'), 'embedding')
-  assert.equal(categorizeModel(m('bge-reranker-v2-m3'), 'chat'), 'unknown')
-})
-
-test('an empty catalog mode is no signal, not a non-chat verdict', () => {
-  assert.equal(categorizeModel(m('acme-model'), ''), 'chat')
-  assert.equal(categorizeModel(m('acme-model'), undefined), 'chat')
+test('an empty mode is no signal, not a non-chat verdict', () => {
+  assert.equal(categorizeModel(m('acme-model', '')), 'chat')
+  assert.equal(categorizeModel(m('acme-model')), 'chat')
 })
 
 // --- display names -----------------------------------------------------------

@@ -12,9 +12,6 @@
 // passed the broken build. So `loadPlugins` below reproduces the loader
 // rule instead of approximating it.
 
-import { createHash } from 'node:crypto'
-import { mkdir, utimes, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
 import type { Plugin, PluginInput } from '@opencode-ai/plugin'
 
 // --- the loader -----------------------------------------------------------
@@ -72,68 +69,38 @@ export function loadPlugins(mod: object): Plugin[] {
 // --- the plugin input -----------------------------------------------------
 
 /**
- * A price table in LiteLLM's `model_prices_and_context_window.json` format:
- * one flat object keyed by model name, costs stated in USD per TOKEN, and the
- * provider carried inside each entry as `litellm_provider`.
- */
-export const PRICE_TABLE = {
-  sample_spec: {
-    litellm_provider: 'one of the providers',
-    input_cost_per_token: 0.0,
-    output_cost_per_token: 0.0,
-  },
-  'azure/gpt-5.4': {
-    litellm_provider: 'azure',
-    max_input_tokens: 922000,
-    max_output_tokens: 128000,
-    max_tokens: 128000,
-    input_cost_per_token: 0.0000025,
-    output_cost_per_token: 0.000015,
-    cache_read_input_token_cost: 0.00000025,
-    input_cost_per_token_above_200k_tokens: 0.000005,
-    output_cost_per_token_above_200k_tokens: 0.0000225,
-    cache_read_input_token_cost_above_200k_tokens: 0.0000005,
-    supports_function_calling: true,
-    supports_reasoning: true,
-    supports_vision: true,
-    supports_pdf_input: true,
-  },
-}
-
-/**
- * The price table the scenarios point `options.catalogURL` at. There is no
- * default in the plugin — every provider names its own table — so this is just
- * the URL the suite happens to configure, served by the fake proxy below.
- */
-export const PRICE_TABLE_URL =
-  'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json'
-
-/** Its pathname, for routing inside the fake proxy. */
-export const PRICE_TABLE_PATHNAME = '/BerriAI/litellm/main/model_prices_and_context_window.json'
-
-/**
- * Write a cache file the plugin will find, aged as asked.
+ * A `/v1/model/info` payload: one row per deployment, `model_name` carrying the
+ * public model-group name (the same string `/v1/models` reports) and
+ * `model_info` carrying LiteLLM's resolved price-map entry, with costs stated
+ * in USD per TOKEN.
  *
- * `load()` picks its source by cache age, so a scenario that means to exercise
- * the fresh- or stale-cache branch has to put one there — otherwise it silently
- * falls through to the live fetch and asserts nothing about caching.
- * Mirrors the envelope written by `writeCache` in src/catalog.ts — including
- * the URL-derived filename, since the cache is keyed per price-table URL; keep
- * `v` in step with CACHE_SCHEMA.
+ * `litellm_params` is present because the real response carries it; the plugin
+ * reads `model_name` and `model_info` only, and a fixture that omitted it could
+ * not catch a reader that started depending on it.
  */
-export async function seedCache(
-  url: string,
-  table: unknown,
-  ageMs: number,
-  v = 3,
-): Promise<void> {
-  const dir = join(process.env.XDG_CACHE_HOME!, 'opencode-plugin-litellm-pricing')
-  await mkdir(dir, { recursive: true })
-  const key = createHash('sha256').update(url).digest('hex').slice(0, 12)
-  const file = join(dir, `price-table-${key}.json`)
-  await writeFile(file, JSON.stringify({ v, url, table }), 'utf8')
-  const when = new Date(Date.now() - ageMs)
-  await utimes(file, when, when)
+export const MODEL_INFO = {
+  data: [
+    {
+      model_name: 'azure-gpt-5.4',
+      litellm_params: { model: 'azure/gpt-5.4' },
+      model_info: {
+        mode: 'chat',
+        max_input_tokens: 922000,
+        max_output_tokens: 128000,
+        max_tokens: 128000,
+        input_cost_per_token: 0.0000025,
+        output_cost_per_token: 0.000015,
+        cache_read_input_token_cost: 0.00000025,
+        input_cost_per_token_above_200k_tokens: 0.000005,
+        output_cost_per_token_above_200k_tokens: 0.0000225,
+        cache_read_input_token_cost_above_200k_tokens: 0.0000005,
+        supports_function_calling: true,
+        supports_reasoning: true,
+        supports_vision: true,
+        supports_pdf_input: true,
+      },
+    },
+  ],
 }
 
 /** Every `client.app.log` body the plugin wrote, in order. */
@@ -144,12 +111,11 @@ export interface LoggedEntry {
 }
 
 /**
- * The members this plugin touches are `client.provider.list({})` and
- * `client.config.providers({})` — see
- * `load()` in src/catalog.ts — and `client.app.log({...})`, the only path into
- * opencode's own log file. Everything else on PluginInput is left off and the
- * whole thing cast, so a test fails loudly if the plugin ever starts reaching
- * for something new rather than silently reading `undefined`.
+ * The members this plugin touches are `client.provider.list({})`,
+ * `client.config.providers({})` and `client.app.log({...})` — the last being
+ * the only path into opencode's own log file. Everything else on PluginInput is
+ * left off and the whole thing cast, so a test fails loudly if the plugin ever
+ * starts reaching for something new rather than silently reading `undefined`.
  *
  * Note this stub cannot verify the *shape* of the app.log call: it is
  * hand-written, so it matches whatever the plugin does. `tsc --noEmit` against
@@ -191,7 +157,7 @@ export function fakePluginInput(
 /** A route handler: return a Response, or throw to simulate an unreachable proxy. */
 export type Route = () => Response | Promise<Response>
 
-/** Keyed by URL pathname, e.g. '/v1/models' or '/model_group/info'. */
+/** Keyed by URL pathname, e.g. '/v1/models' or '/v1/model/info'. */
 export type Routes = Record<string, Route>
 
 export function json(body: unknown, status = 200): Response {
@@ -203,9 +169,9 @@ export function json(body: unknown, status = 200): Response {
 
 /**
  * Every URL the fake proxy was asked for during the current `withFakeProxy`,
- * in order. A route that throws is NOT an assertion — `refreshInBackground`
- * swallows its own failures, so "this path must not hit the network" has to be
- * checked here rather than left to a throw nobody observes.
+ * in order. A route that throws is NOT an assertion — the plugin swallows a
+ * failed /v1/model/info on purpose — so "this path must not be fetched" has to
+ * be checked here rather than left to a throw nobody observes.
  */
 export const fetchedURLs: string[] = []
 
@@ -221,15 +187,10 @@ export async function withFakeProxy<T>(routes: Routes, fn: () => Promise<T>): Pr
   const stub = async (input: unknown): Promise<Response> => {
     const url = new URL(String(input))
     fetchedURLs.push(url.href)
-    // The price table is fetched from its own URL, not from the proxy — see
-    // load() in src/catalog.ts. Scenarios that don't care get the default
-    // table; one that does can override the route.
-    const route =
-      routes[url.pathname] ?? (url.pathname === PRICE_TABLE_PATHNAME ? priceTable : undefined)
+    const route = routes[url.pathname]
     if (!route) throw new Error(`fake proxy: no route for ${url.pathname}`)
     return route()
   }
-  const priceTable = () => json(PRICE_TABLE)
   globalThis.fetch = stub as unknown as typeof globalThis.fetch
   try {
     return await fn()

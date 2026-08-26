@@ -5,10 +5,11 @@ An [OpenCode](https://opencode.ai) plugin that lists the models on a
 picker with a per-model `cost` block, so OpenCode shows real pricing instead of
 `$0`.
 
-The proxy is asked only for its model list. Prices come from a table in
-LiteLLM's `model_prices_and_context_window.json` format, matched by model name,
-so `ai-gateway-gpt-5.4` is priced as `gpt-5.4`. You name the table — the plugin
-fetches no URL you did not configure.
+Everything comes from the proxy itself: `/v1/models` for the model list,
+`/v1/model/info` for each model's price, kind, limits and capabilities. One URL
+to configure, nothing fetched that you did not point it at, no local cache.
+
+Requires **LiteLLM v1.96.0 or newer** — see [Requirements](#requirements).
 
 ## Install
 
@@ -24,8 +25,7 @@ Add the plugin and a LiteLLM provider to your `opencode.json`:
       "name": "LiteLLM (proxy)",
       "options": {
         "baseURL": "https://litellm.example.com/v1",
-        "apiKey": "{env:LITELLM_API_KEY}",
-        "catalogURL": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+        "apiKey": "{env:LITELLM_API_KEY}"
       }
     }
   }
@@ -37,30 +37,9 @@ The key is read from `options.apiKey`, else `$LITELLM_API_KEY` /
 `$LITELLM_MASTER_KEY`. Extra auth headers (e.g. Cloudflare Access) go in
 `options.customHeaders`.
 
-### The price table
-
-`options.catalogURL` is required for pricing and has **no default**: the plugin
-fetches the table you name and nothing else. A provider without one still gets
-its models discovered and injected — they just carry no cost, and the startup
-log says why.
-
-The table earns its keep twice. Besides cost, each entry carries LiteLLM's
-`mode` — `chat`, `embedding`, `image_generation`, and so on — which is what
-keeps embedders, rerankers and image generators out of the model picker. The
-proxy can answer that question too, via `/model_group/info`, but LiteLLM closes
-that route to any key created as `key_type: "llm_api"`. On such a key the
-catalog is the only classification the plugin has.
-
-LiteLLM's published [`model_prices_and_context_window.json`][litellm-prices]
-covers the public model line and is what the example above points at. If your
-gateway serves an enriched copy — the upstream entries plus your own model
-names, with their real context and pricing — point `catalogURL` at that
-instead; those models then price by exact key rather than by substring against
-the public line. Same format either way: one flat JSON object keyed by model
-name, costs in USD per token. It is fetched once and cached — see
-[The cache](#the-cache).
-
-[litellm-prices]: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+Upgrading from 0.8.0 or earlier: delete `options.catalogURL` (or the older
+`options.pricingURL`). Neither is read any more, and a config still carrying one
+gets a warning saying so.
 
 ## How pricing works
 
@@ -74,62 +53,36 @@ Each chat-capable model is injected with a config entry like:
 }
 ```
 
-Cost, limits and capabilities come from the price table, matched in two steps:
+Cost, limits and capabilities come from `/v1/model/info`, keyed by `model_name`
+— the same string `/v1/models` reports, so no name matching is involved. These
+are LiteLLM's own resolved numbers, your config-level `model_info` overrides
+included, so what OpenCode displays is what the gateway bills. They are stated
+per token and converted to OpenCode's per-1M units.
 
-1. **Exact key.** A table entry named exactly as the proxy reports the model
-   wins. This is what an enriched table is for.
-2. **Bounded substring.** Otherwise `ai-gateway-gpt-5.4` → `gpt-5.4`.
-   Longest match wins, so `…-mini` beats the base; `azure` is preferred over
-   `openai`, and no other provider prefix is considered.
-
-Table costs are per token and are converted to OpenCode's per-1M units. They are
-public list prices, not your negotiated rates, unless your own table says
-otherwise.
-
-Models with no match are injected without a `cost` block rather than with a
-wrong one. A match priced `0/0` across the board is treated the same way —
-LiteLLM's table carries such entries for models that are plainly billable.
-Wildcard (`*`) entries are skipped; they are access rules, not models. Entries
-you have hand-curated under `provider.*.models` are never overwritten.
+Where a model group has several deployments, the one that resolved a price wins.
+Models the proxy reports no cost for are injected **without** a `cost` block
+rather than with a wrong one — usually a deployment whose `base_model` is unset
+or misspelled, so LiteLLM cannot map it to a price-map entry. The startup log
+names them. Wildcard (`*`) entries are skipped; they are access rules, not
+models. Entries you have hand-curated under `provider.*.models` are never
+overwritten.
 
 Tiered pricing: opencode models a single `context_over_200k` tier, mapped from
-the table's `*_above_200k_tokens` fields. `*_above_272k_tokens` is not mapped,
+LiteLLM's `*_above_200k_tokens` fields. `*_above_272k_tokens` is not mapped,
 since forcing it into the 200k bucket would overcharge everything in between.
-
-**Why not LiteLLM's own numbers?** `/v1/model/info` carries them, but reading it
-requires an admin key. Normal virtual keys get nothing back, so it is not usable
-as a pricing source.
-
-### The cache
-
-The table is cached under `$XDG_CACHE_HOME/opencode-plugin-litellm-pricing/`
-(`~/.cache/…` by default), keyed by URL:
-
-| source | when |
-| --- | --- |
-| `cache` | the cached copy is less than 7 days old — no network at all |
-| `stale cache (refreshing)` | it is older than 7 days: served anyway, with a refresh in the background |
-| the price-table URL | no usable cache, so the table is fetched before the picker is built (3-second limit) |
-
-The startup log names which one answered. No price table ships in the package,
-so a start with no usable cache — a fresh install, a cleared cache, an upgrade
-that changes the cache format — fetches one. If that fetch fails, models are
-injected without a `cost` block and the log says so.
 
 ## Non-chat models
 
 Embedding, image, audio, rerank and moderation models are kept out of the
-picker. `/v1/models` returns only `{id, object, created, owned_by}`, so the
-plugin also reads `/model_group/info`, which reports `mode` and the capability
-flags under the same ids. Anything whose mode isn't `chat` / `completion` /
-`responses` is dropped, and the limits and flags fill in what the price table
-doesn't cover.
+picker, on LiteLLM's own `mode` field — carried both by `/v1/models` and by
+every `/v1/model/info` entry. Anything whose mode isn't `chat` / `completion` /
+`responses` is dropped.
 
-That call is best-effort with a 3-second budget. If your proxy doesn't allow it,
-models are classified by name instead — `*-embedding-*`, `*rerank*`, `dall-e-*`
-and so on. The patterns are deliberately narrow, since a false positive hides a
-usable model; the trade-off is that an oddly named non-chat model can slip
-through. The startup log says which path ran.
+If neither call reports a mode — an older proxy, or a key that cannot read
+`/v1/model/info` — models are classified by name instead: `*-embedding-*`,
+`*rerank*`, `dall-e-*` and so on. The patterns are deliberately narrow, since a
+false positive hides a usable model; the trade-off is that an oddly named
+non-chat model can slip through.
 
 ## The startup log
 
@@ -143,7 +96,6 @@ grep litellm-pricing ~/.local/share/opencode/log/opencode.log
 A healthy run:
 
 ```
-[litellm-pricing] catalog: 3001 model(s) from cache — substring match via azure, openai
 [litellm-pricing] litellm: 34 models, 31 priced, 7 hidden
 [litellm-pricing]   no pricing: my-finetune-v2, internal-router, … +1 more
 ```
@@ -151,15 +103,18 @@ A healthy run:
 `34 models` is what reached the picker, `31 priced` how many of those carry
 cost, and `7 hidden` everything the proxy offered that was not injected —
 non-chat models, wildcard access rules, and ids already in your config.
-Unpriced models are named, not just counted. `N models, 0 priced` is logged as a
-warning — usually the catalog line above will say it was unavailable or empty,
-or that no `catalogURL` was configured at all:
+Unpriced models are named, not just counted.
+
+`N models, 0 priced` is logged as a warning. Nothing priced at all almost always
+means the pricing endpoint could not be read, and the line says so:
 
 ```
-[litellm-pricing] provider "litellm" has no options.catalogURL — set it to a
-  model catalog in LiteLLM `model_prices_and_context_window.json` format;
-  every model will be injected without pricing.
+[litellm-pricing] litellm: 34 models, 0 priced, 7 hidden — /v1/model/info
+  unreadable: needs LiteLLM v1.96.0+ and a key allowed to call it
 ```
+
+A handful of unpriced models among priced ones is the other case: those are
+per-deployment `base_model` gaps, not a version problem.
 
 ## Provider matching
 
@@ -173,10 +128,21 @@ plugin does nothing.
 
 - OpenCode with plugin support
 - Node 22+
-- A reachable LiteLLM proxy
-- A price table in LiteLLM `model_prices_and_context_window.json` format, and
-  outbound access to it. Needed on the first start; after that the cache
-  answers and refreshes happen in the background
+- A reachable LiteLLM proxy, **v1.96.0 or newer**. That release moved
+  `/model/info` and `/v1/model/info` into `llm_api_routes`, so an ordinary
+  virtual key can read pricing; before it, only a key with admin-shaped
+  privileges could. On an older proxy the models are still discovered and
+  injected, just unpriced.
+- A key allowed to call `/v1/model/info`. A key created with
+  `key_type: "llm_api"` is enough. If yours has an explicit `allowed_routes`
+  list, `/v1/model/info` has to be in it.
+
+Check both at once:
+
+```sh
+curl -s -H "Authorization: Bearer $LITELLM_API_KEY" \
+  https://litellm.example.com/v1/model/info | jq '.data[0].model_info'
+```
 
 ## Releasing
 

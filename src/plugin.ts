@@ -5,26 +5,24 @@
 // per-model `cost` block, so opencode's cost display matches what LiteLLM
 // bills.
 //
-// Cost comes from one source: a price table in LiteLLM's
-// `model_prices_and_context_window.json` format, matched to each model by name
-// (public list prices). The proxy is asked what models the key can see
-// (/v1/models) and what kind of model each one is (/model_group/info) — never
-// for pricing.
+// Everything comes from the proxy itself: what models the key can see
+// (/v1/models), and what each one costs, what kind of model it is, and what it
+// can do (/v1/model/info). No second URL, no price table, no local cache.
+//
+// This needs **LiteLLM v1.96.0 or newer**. That release moved `/model/info`
+// and `/v1/model/info` into `llm_api_routes`, which is what a key created with
+// `key_type: "llm_api"` carries; before it, reading pricing meant handing the
+// plugin a key with admin-shaped privileges. Against an older proxy — or a key
+// scoped to exclude the route — models are still discovered and injected, just
+// unpriced.
+//
+// The prices are LiteLLM's own resolved numbers, config overrides included, so
+// opencode's cost display matches what the gateway bills. A deployment whose
+// `base_model` mapping is missing or wrong resolves to no cost at all rather
+// than to a wrong one: those models are injected unpriced and named in the log.
 //
 // `options.baseURL` is required. The plugin talks to that URL and nothing
 // else: there is no default and no port auto-detection.
-//
-// `options.catalogURL` is required for pricing, and has no default: point it
-// at a price table in LiteLLM's `model_prices_and_context_window.json` format.
-// LiteLLM's own published table is the obvious choice; an enriched copy — same
-// format, plus entries for your gateway's own model names — prices those models
-// by exact name instead of by substring match against the public model line.
-// Without it, models are still discovered and injected, just unpriced.
-//
-// The table is also where each model's `mode` comes from — the field that keeps
-// embedders and image generators out of the picker. The proxy can supply it too
-// (/model_group/info), but LiteLLM closes that route to `key_type: "llm_api"`
-// keys, so on those the catalog is the only classification there is.
 //
 // Configure in opencode.json:
 //
@@ -36,24 +34,21 @@
 //         "name": "LiteLLM (proxy)",
 //         "options": {
 //           "baseURL": "https://litellm.example.com/v1",
-//           "apiKey": "{env:LITELLM_API_KEY}",
-//           "catalogURL": "https://catalog.example.com/model_prices_and_context_window.json"
+//           "apiKey": "{env:LITELLM_API_KEY}"
 //         }
 //       }
 //     }
 //   }
 
 import type { Config, Plugin, PluginInput } from '@opencode-ai/plugin'
-import type { LiteLLMModel, LiteLLMModelGroupInfo } from './types.ts'
-import type { CatalogFields } from './catalog.ts'
+import type { LiteLLMModel, LiteLLMModelInfo } from './types.ts'
 import {
-  discoverLiteLLMModelGroups,
+  discoverLiteLLMModelInfo,
   discoverLiteLLMModels,
   normalizeBaseURL,
   resolveApiKey,
 } from './litellm-api.ts'
-import { configModelFromCatalog, enrichModel, groupInfoToModelInfo } from './build-config-model.ts'
-import { getCatalog, getCatalogStatus } from './catalog.ts'
+import { configModelFromProxy, enrichModel } from './build-config-model.ts'
 
 // Default provider id — kept identical to the npm package name so the
 // `plugin` and `provider` keys in opencode.json read the same.
@@ -90,14 +85,15 @@ const injectedModelIds = new Map<string, Set<string>>()
 const UNPRICED_LIST_LIMIT = 15
 
 /**
- * Price-table URLs already reported on. The catalog is loaded once per process
- * per URL, so report on each one once too.
+ * Provider ids already warned about a dead price-table option, so a config
+ * carrying one is mentioned once per process rather than on every `config`
+ * invocation.
  */
-const reportedCatalogs = new Set<string>()
+const reportedStaleOptions = new Set<string>()
 
 /** Clear the once-per-process report guard — used by tests. */
-export function resetReportedCatalog(): void {
-  reportedCatalogs.clear()
+export function resetReportedStaleOptions(): void {
+  reportedStaleOptions.clear()
 }
 
 /**
@@ -129,14 +125,11 @@ function readCustomHeaders(options: Record<string, unknown>): Record<string, str
 }
 
 export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
-  // No catalog preload here. The price-table URL is per-provider config
-  // (`options.catalogURL`), and provider options do not exist until the
-  // `config` hook runs — so the table is loaded there, awaited before any model
-  // is priced. That hook is invoked exactly ONCE (measured under both `serve`
-  // and the CLI), so there is no later pass to fill prices in on, and the load
-  // must therefore be one that is safe to wait on: see catalog.ts, where every
-  // answering branch reads from disk and the network is only ever a background
-  // refresh. Asking opencode itself for the table is what used to deadlock.
+  // Nothing is fetched here. Every URL the plugin talks to is per-provider
+  // config (`options.baseURL`), and provider options do not exist until the
+  // `config` hook runs — so both calls are made there, and awaited before any
+  // model is injected. That hook is invoked exactly ONCE (measured under both
+  // `serve` and the CLI), so there is no later pass to fill prices in on.
 
   // Every message goes to both sinks. console reaches whoever is attached to
   // the opencode server's stdout; client.app.log is the only path into
@@ -144,8 +137,8 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
   // "why does this model show $0?" after the fact will actually look.
   //
   // Fire-and-forget on purpose: client calls made from inside the `config`
-  // hook are re-entrant (see the comment on load() in catalog.ts), so awaiting
-  // one here risks stalling startup. A failed log must never be able to break
+  // hook are re-entrant — asking opencode itself for anything from in here is
+  // what used to deadlock startup — so awaiting one risks stalling it. A failed log must never be able to break
   // config loading either — hence try/catch and not just `.catch()`: an SDK
   // without `client.app.log` throws synchronously, and that throw would escape
   // the hook and lose every injected model.
@@ -202,77 +195,27 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
         }
         const baseURL = normalizeBaseURL(configuredBase)
 
-        // The price table this provider prices from, loaded only once the
-        // provider is known to be usable: a provider with no baseURL injects
-        // nothing, so loading (and reporting on) a table for it is pure noise.
-        // Awaiting it is what the hook running exactly once forces: there is
-        // no second pass to price into. After the first start it costs nothing
-        // — the load answers from the on-disk cache and refreshes in the
-        // background (see catalog.ts).
-        //
-        // There is no default URL, for the same reason there is no default
-        // baseURL: the plugin fetches what its operator named and nothing else.
-        // An unset catalogURL is a configuration gap to report, not a licence
-        // to reach out to a hardcoded third-party host on every fresh install.
-        // Discovery still runs — the models are worth having unpriced, and the
-        // warning says exactly why they have no cost.
-        const catalogURL =
+        // Pricing used to come from a separately configured price table:
+        // `options.catalogURL` (and `options.pricingURL` before 0.7.0). Both
+        // are dead now that the proxy answers with its own numbers, and
+        // neither is read. Say so rather than ignoring them silently: a config
+        // still carrying one was written by someone who wanted pricing, and a
+        // dead key is exactly what would make them think it is still doing the
+        // work. Warned once per provider per process.
+        const staleOption =
           typeof options.catalogURL === 'string' && options.catalogURL
-            ? options.catalogURL
-            : undefined
-        const catalog = catalogURL ? await getCatalog(catalogURL) : null
-        const resolveCatalog = (name: string): CatalogFields | null =>
-          catalog?.resolve(name) ?? null
-
-        if (!catalogURL) {
-          // Warned once per provider, not once per process: two providers can
-          // be misconfigured independently, and naming the one that is missing
-          // its table is the whole value of the message.
-          //
-          // `pricingURL` was this option's name up to 0.6.0. It is not read —
-          // renaming it and then quietly falling back would leave two live
-          // spellings forever — but a config still carrying only the old key
-          // is the one case where "no catalog URL" is misleading, so the
-          // message says which key to rename.
-          const hasLegacyKey =
-            typeof options.pricingURL === 'string' && options.pricingURL
+            ? 'catalogURL'
+            : typeof options.pricingURL === 'string' && options.pricingURL
+              ? 'pricingURL'
+              : undefined
+        if (staleOption && !reportedStaleOptions.has(providerId)) {
+          reportedStaleOptions.add(providerId)
           report(
             'warn',
-            `[litellm-pricing] provider "${providerId}" has no options.catalogURL — ` +
-              'set it to a model catalog in LiteLLM `model_prices_and_context_window.json` ' +
-              'format; every model will be injected without pricing.' +
-              (hasLegacyKey ? ' Found options.pricingURL: rename it to catalogURL.' : ''),
+            `[litellm-pricing] provider "${providerId}": options.${staleOption} is no longer read — ` +
+              'pricing now comes from the proxy itself (/v1/model/info, LiteLLM v1.96.0+). ' +
+              'Remove it.',
           )
-        } else if (!reportedCatalogs.has(catalogURL)) {
-          // Once per price-table URL, not per provider: two providers sharing a
-          // table share its one load, so a second report would only repeat it.
-          reportedCatalogs.add(catalogURL)
-          const status = getCatalogStatus(catalogURL)
-          // `ok` always carries a non-empty catalog — catalogFrom() returns null
-          // at zero candidates, so a zero-candidate `ok` cannot be constructed.
-          // `stale cache (refreshing)` is a success too, not a degraded state,
-          // and must not warn: it is what keeps startup off the network.
-          if (status.state === 'ok') {
-            // Name the providers the substring pass can draw on — or say it is
-            // inert, which is what a table carrying neither azure nor openai
-            // entries means: only exact model names will price.
-            // Named `substringProviders`, not `providers`: the enclosing
-            // scope already has a `providers` — the config's provider map.
-            const substringProviders = status.matchedProviders ?? []
-            report(
-              'info',
-              `[litellm-pricing] catalog: ${status.candidateCount} model(s) from ${status.source} — ` +
-                (substringProviders.length > 0
-                  ? `substring match via ${substringProviders.join(', ')}`
-                  : 'exact model names only (no azure/openai entries to match by substring)'),
-            )
-          } else {
-            report(
-              'warn',
-              `[litellm-pricing] price catalog unavailable from ${catalogURL} ` +
-                `(${status.reason}) — every model will be injected without pricing.`,
-            )
-          }
         }
 
         // Ensure the provider entry is minimally wired.
@@ -303,12 +246,6 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           const already = injectedModelIds.get(injectedKey)
           if (already && [...already].every((id) => models[id])) return
 
-          // Pricing is never requested from the proxy. LiteLLM's per-model
-          // numbers depend on the deployment having base_model set correctly —
-          // an easy thing to get wrong, which then bills $0. Matching the model
-          // name against the catalog gives the same answer for every key, with
-          // one code path.
-          //
           // No standalone health probe: /v1/models is the same request a probe
           // would make, and its failure already means "offline".
           let discovered: LiteLLMModel[]
@@ -331,17 +268,16 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
             return
           }
 
-          // What kind of model each one is. /v1/models carries no `mode`, so
-          // without this the non-chat filter can only guess from the id.
-          // Strictly best-effort — it is not settled whether this endpoint
-          // needs an elevated key, so any failure (refused, missing, slow)
-          // falls back to the id heuristics rather than blocking or dropping
-          // models.
-          let groups: Map<string, LiteLLMModelGroupInfo> | null = null
+          // What each model costs, what kind of model it is, and what it can
+          // do. Best-effort by necessity: a proxy older than LiteLLM v1.96.0,
+          // or a key scoped to exclude the route, refuses it. Every model is
+          // still injected in that case — unpriced, and classified by the
+          // `mode` on /v1/models if it carries one, else by the id heuristics.
+          let infoByName: Map<string, LiteLLMModelInfo> | null = null
           try {
-            groups = await discoverLiteLLMModelGroups(baseURL, apiKey, customHeaders)
+            infoByName = await discoverLiteLLMModelInfo(baseURL, apiKey, customHeaders)
           } catch {
-            groups = null
+            infoByName = null
           }
 
           // Every discovered entry lands in exactly one of these, so the
@@ -379,17 +315,11 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
               continue
             }
 
-            // /model_group/info is keyed by model_group, which is exactly
-            // the id /v1/models reports — no alias resolution needed.
-            const group = groups?.get(model.id)
-            const enriched = group ? enrichModel(model, groupInfoToModelInfo(group)) : model
-
-            // Name-match against the price table: an exact key wins outright
-            // (an enriched table can carry `ai-gateway/gpt-5.4` itself), and
-            // otherwise `ai-gateway-gpt-5.4` resolves to `gpt-5.4` by bounded
-            // substring (longest match wins, so `…-mini` beats the base model).
-            const fields = resolveCatalog(model.id)
-            const entry = configModelFromCatalog(enriched, fields)
+            // /v1/model/info is keyed by model_name, which is exactly the id
+            // /v1/models reports — no alias resolution needed.
+            const info = infoByName?.get(model.id)
+            const enriched = info ? enrichModel(model, info) : model
+            const entry = configModelFromProxy(enriched, info)
 
             if (!entry) {
               skipped++
@@ -416,18 +346,23 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
           // shape, so it warns rather than informs.
           //
           // Counts only, on one short line. `hidden` folds every reason a
-          // discovered model did not get injected: the per-reason breakdown,
-          // the baseURL and the /model_group/info fallback marker all read as
-          // problems on a run where nothing is wrong. The URL is in the user's
-          // own config, and the discovery-failure warning above already names
-          // the host that did not answer. The one fallback worth acting on —
-          // no catalog at all — likewise has its own warning above; falling
-          // back to the id heuristics for `mode` is normal operation and is
-          // not worth a line.
+          // discovered model did not get injected: the per-reason breakdown and
+          // the baseURL both read as problems on a run where nothing is wrong.
+          // The URL is in the user's own config, and the discovery-failure
+          // warning above already names the host that did not answer.
+          //
+          // Nothing priced at all is the systematic-failure shape, and the
+          // cause is almost always the same one — so name it, with the version
+          // that fixes it. A per-model gap (an unmapped base_model) shows up in
+          // the `no pricing:` line below instead.
           const hidden = skipped + wildcards + preexisting + reinjected + malformed
+          const nothingPriced = added > 0 && priced === 0
           report(
-            added > 0 && priced === 0 ? 'warn' : 'info',
-            `[litellm-pricing] ${providerId}: ${added} models, ${priced} priced, ${hidden} hidden`,
+            nothingPriced ? 'warn' : 'info',
+            `[litellm-pricing] ${providerId}: ${added} models, ${priced} priced, ${hidden} hidden` +
+              (nothingPriced && !infoByName
+                ? ' — /v1/model/info unreadable: needs LiteLLM v1.96.0+ and a key allowed to call it'
+                : ''),
           )
 
           // Name them: a count alone doesn't say which model will read as free.
@@ -445,9 +380,9 @@ export const LiteLLMPricingPlugin: Plugin = async (input: PluginInput) => {
         }
 
         // No outer race: every await inside `work()` is individually bounded
-        // (AbortSignal.timeout on the HTTP calls, CATALOG_TIMEOUT_MS on the
-        // catalog). A blanket timeout here only ever hid an unbounded call
-        // while still charging the user its full duration at startup.
+        // (AbortSignal.timeout on both HTTP calls). A blanket timeout here only
+        // ever hid an unbounded call while still charging the user its full
+        // duration at startup.
         await work()
       }
     },
