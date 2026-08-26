@@ -87,12 +87,18 @@ export async function discoverLiteLLMModels(
  *
  * The tie-breaker between two deployments of one model group: LiteLLM resolves
  * cost per deployment, so a group whose first deployment has no `base_model`
- * mapping and whose second one does must resolve to the second. Only
- * `input_cost_per_token` is checked — `buildCost` needs input AND output, and a
- * block carrying one without the other does not occur in practice.
+ * mapping and whose second one does must resolve to the second.
+ *
+ * Both fields are checked because both are what `buildCost` needs: a row
+ * carrying only `input_cost_per_token` (some audio/rerank price-map entries
+ * price output per second, not per token) emits no `cost` at all, so treating
+ * it as priced would let it beat a sibling deployment that does resolve both.
  */
 function hasPrice(info: LiteLLMModelInfo | undefined): boolean {
-  return typeof info?.input_cost_per_token === 'number'
+  return (
+    typeof info?.input_cost_per_token === 'number' &&
+    typeof info?.output_cost_per_token === 'number'
+  )
 }
 
 /**

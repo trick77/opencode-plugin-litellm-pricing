@@ -170,6 +170,27 @@ test('a later unpriced deployment does not clobber the priced one', async () => 
   }
 })
 
+test('a row priced on input alone does not beat a fully priced deployment', async () => {
+  const restore = mockFetchOnce({
+    data: [
+      // Input cost but no output cost — `buildCost` emits nothing for this
+      // row, so counting it as priced would leave the whole group unpriced.
+      { model_name: 'ai-gateway-gpt-5.4', model_info: { mode: 'chat', input_cost_per_token: 0.000001 } },
+      {
+        model_name: 'ai-gateway-gpt-5.4',
+        model_info: { mode: 'chat', input_cost_per_token: 0.000001, output_cost_per_token: 0.000002 },
+      },
+    ],
+  })
+  try {
+    const infoByName = await discoverLiteLLMModelInfo('http://proxy')
+    const entry = inject({ id: 'ai-gateway-gpt-5.4', object: 'model' }, infoByName)!
+    assert.deepEqual(entry.cost, { input: 1, output: 2 })
+  } finally {
+    restore()
+  }
+})
+
 test('mode null falls back to the name heuristic rather than hiding the model', async () => {
   const restore = mockFetchOnce(MODEL_INFO_FIXTURE)
   try {

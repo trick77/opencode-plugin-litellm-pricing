@@ -57,7 +57,8 @@ then `cd test/probe && opencode models`.
   `/v2/model/info` stayed in `info_routes` = elevated key = 403 for exactly the
   keys this serves.
 - Rows are per DEPLOYMENT: several can share a `model_name`. Dedupe = first row
-  with `input_cost_per_token` wins, else first row. One deployment missing
+  carrying BOTH `input_cost_per_token` and `output_cost_per_token` (what
+  `buildCost` needs) wins, else first row. One deployment missing
   `base_model` must not price the whole group at nothing.
 - A deployment with no `base_model` mapping resolves to NO cost fields, not to
   0 — so it injects unpriced and gets named in the log. Never invent a fallback.
