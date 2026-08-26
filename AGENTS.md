@@ -19,8 +19,7 @@ OpenCode plugin that injects per-model **cost** for LiteLLM proxy models.
   1.18.6). Change loader/hook behaviour → update it. Give each scenario its OWN
   baseURL: `injectedModelIds` is unreset module state, so a shared URL sends the
   second scenario down the early-return, passing having done nothing. Helpers in
-  `test/helpers/` so the `test/*.test.ts` glob skips them. The suite points
-  `XDG_CACHE_HOME` at a temp dir — keep it that way or it reads your real cache.
+  `test/helpers/` so the `test/*.test.ts` glob skips them.
 - Harness runs on NODE; OpenCode runs BUN. Touching `src/index.ts` exports or
   anything transpiler-sensitive → also load for real: scratch dir with
   `"plugin": ["file:///<abs-path-to-checkout>"]` (no LiteLLM provider needed),
@@ -29,8 +28,8 @@ OpenCode plugin that injects per-model **cost** for LiteLLM proxy models.
 
 ## The probe — USE IT for anything startup-related
 
-`npm test` calls the `config` hook directly → blind to startup: catalog load,
-hook invocation count, client-call timing, prices reaching the picker. Use
+`npm test` calls the `config` hook directly → blind to startup: hook invocation
+count, client-call timing, prices reaching the picker. Use
 `test/probe/` (its README has the commands): `node test/probe/fake-proxy.mjs`,
 then `cd test/probe && opencode models`.
 
@@ -48,45 +47,31 @@ then `cd test/probe && opencode models`.
   `{ input, output, cache_read, cache_write, context_over_200k }`,
   `additionalProperties:false`. NEVER emit a nested `cache` object — the schema
   rejects it and the whole `cost` is dropped. Values are USD per 1M tokens.
-- ONE cost source: the configured price table, in LiteLLM
-  `model_prices_and_context_window.json` format (`options.catalogURL`, NO
-  default — unset means inject unpriced + warn). Costs are per-TOKEN — they MUST go through
-  `buildCost`/`perMillion` (×1e6). Never source cost from the proxy — its
-  numbers need `model_info.base_model` set right, else they silently bill $0.
-- NEVER await a fetch on the startup path once a cache exists. The `config`
-  hook runs once, before anything renders, so a fetch there is a stall the user
-  sits through. `load()` answers from cache (7d) → stale cache (background
-  refresh) → fetch. That last branch is the FIRST start only: nothing ships in
-  the package, and the hook has no second pass, so an unpriced injection there
-  stays unpriced all session. Background refresh must `.catch()` — nothing
-  observes it, and an unhandled rejection kills the process. Safe to leave
-  pending: opencode exits without draining the event loop (measured: CLI exited
-  216ms in with a black-holed 3s fetch outstanding), so it lands in long
-  sessions and is simply skipped in short ones.
-- NEVER ship a price table in the package. It goes stale between releases and
-  bloats the install; the cache is the only local copy. Bump `CACHE_SCHEMA`
-  when `KEEP_FIELDS` changes, else old caches are served as if complete.
-- The cache file is keyed by a hash of the price-table URL. Two providers on
-  two tables must never read each other's prices.
-- NEVER filter the table by provider when trimming/caching. Only the SUBSTRING
-  pass is restricted to `azure`/`openai`; the exact-key pass sees everything,
-  and a provider filter would strip out precisely the enriched entries a custom
-  table exists to provide.
-- Pin prices against fixtures only (`PRICE_TABLE`), seeded via the harness
-  `seed` option or served by the fake proxy — never against live upstream data.
+- ONE cost source: `/v1/model/info` on the configured proxy, keyed by
+  `model_name` = the `/v1/models` id. Costs are per-TOKEN — they MUST go through
+  `buildCost`/`perMillion` (×1e6). No price table, no `catalogURL`, no disk
+  cache: all removed in 0.9.0 (`options.catalogURL`/`pricingURL` still sniffed,
+  warned as dead, NEVER read).
+- `/v1/model/info` ONLY, never `/v2/model/info`. LiteLLM v1.96.0 put
+  `model_info_routes` (`/model/info`, `/v1/model/info`) into `llm_api_routes`;
+  `/v2/model/info` stayed in `info_routes` = elevated key = 403 for exactly the
+  keys this serves.
+- Rows are per DEPLOYMENT: several can share a `model_name`. Dedupe = first row
+  carrying BOTH `input_cost_per_token` and `output_cost_per_token` (what
+  `buildCost` needs) wins, else first row. One deployment missing
+  `base_model` must not price the whole group at nothing.
+- A deployment with no `base_model` mapping resolves to NO cost fields, not to
+  0 — so it injects unpriced and gets named in the log. Never invent a fallback.
 - NEVER go back to `client.config.providers()` for cost: deadlocks (above), and
   lists only the reader's configured providers — no Azure creds → no `azure`,
   and its `openai` entry reports every cost as 0 → real models priced $0.
-- One table shape: flat, keyed by model name, `litellm_provider` inside the
-  entry, costs per TOKEN. Skip the `sample_spec` key — it is a doc stub.
 - Emit `cost` only when both `input` and `output` are known. Keep a real `0`
   (free tier); drop only absent values.
-- EXCEPTION, table path only (`toCatalogFields`): a cost that is zero across
-  the board is the table saying "no number", not "free" — upstream ships 124
-  such entries, some plainly billable. Drop the whole `cost`; the model is
-  injected unpriced and named in the log. Do NOT move this into `buildCost`.
+- Build `cost` fresh per entry — one info object serves several ids; a shared
+  block (nested `context_over_200k` included) aliases into opencode's config.
 - Tiering: map LiteLLM `*_above_200k_tokens` → `context_over_200k`. Do NOT map
   `*_above_272k_tokens` (would overcharge the 200k–272k band).
+- Pin prices against fixtures only — never against live upstream data.
 
 ## LiteLLM field semantics
 
@@ -99,17 +84,17 @@ then `cd test/probe && opencode models`.
 
 - `options.baseURL` is REQUIRED. No default URL, no port probing, never
   localhost. Missing → warn and skip the provider.
-- `/v1/models` carries NO `mode` (shape: `id/object/created/owned_by`).
-- `categorizeModel` signal order: proxy `mode` → id heuristics (non-chat hits
-  only) → catalog `mode` → default chat. Heuristics before catalog: a catalog
-  match may be a SUBSTRING.
-- Proxy `mode`: `/model_group/info`, keyed by `model_group` = the `/v1/models`
-  id. Best-effort, 3s budget, ANY failure falls back; never block/throw/drop.
-  403s by DEFAULT for `key_type: "llm_api"` keys (`allowed_routes:
-  ["llm_api_routes"]`; this route is in `info_routes`). Not a misconfiguration.
-- Catalog `mode`: `KEEP_FIELDS` → `CatalogFields.mode`. Often the ONLY signal.
-  Classification input ONLY — `applyCatalogFields` must never copy it out.
-- Both sources go through `categorizeMode`, an ALLOW-list
+- `/v1/models` on current LiteLLM carries `mode`/`max_input_tokens`/
+  `max_output_tokens` (never cost); older proxies return
+  `id/object/created/owned_by` alone. `enrichModel` fills the gaps from the
+  `/v1/model/info` block — lean entry WINS, info block only fills.
+- `categorizeModel` signal order: `mode` → id heuristics → default chat.
+- `/v1/model/info` is best-effort: full 15s budget (it is the pricing source,
+  not enrichment), ANY failure falls back; never block/throw/drop. Refused →
+  unpriced + the summary names v1.96.0. Pre-v1.96.0 it 403s for `key_type:
+  "llm_api"` keys — not a misconfiguration.
+- `mode` is classification input ONLY — never copy it into the emitted entry.
+- Mode goes through `categorizeMode`, an ALLOW-list
   (`chat`/`completion`/`responses`); any other non-empty mode is non-chat.
   `null`/absent → next signal. LiteLLM really does emit `mode: null`.
 - Id heuristics stay narrow — a false positive HIDES a working chat model.
@@ -123,9 +108,6 @@ then `cd test/probe && opencode models`.
   that log call; never let it break config loading.
 - Fail soft: warn and continue; never throw out of the `config` hook. Skip
   malformed entries and wildcard (`*`) ids.
-- Name match: EXACT table key first (case-insensitive, any provider), then
-  bounded substring — longest-match, boundary-anchored, leading `<provider>/`
-  stripped, providers `azure` then `openai` only.
 
 ## Release
 

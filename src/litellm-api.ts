@@ -1,6 +1,5 @@
 // LiteLLM proxy HTTP client: model discovery from /v1/models, and per-model
-// capabilities from /model_group/info. Pricing is never asked of the proxy —
-// it comes from the price-table catalog (see catalog.ts).
+// pricing, limits and capabilities from /v1/model/info.
 //
 // Every call targets the caller-supplied base URL and nothing else. There is
 // deliberately no default URL and no port auto-detection: an unconfigured
@@ -9,25 +8,24 @@
 
 import type {
   LiteLLMModel,
-  LiteLLMModelGroupInfo,
-  LiteLLMModelGroupResponse,
+  LiteLLMModelInfo,
+  LiteLLMModelInfoResponse,
   LiteLLMModelsResponse,
 } from './types.ts'
 
 const MODELS_ENDPOINT = '/v1/models'
-// NOTE: no `/v1` prefix. Unlike `/model/info` (which LiteLLM also aliases as
-// `/v1/model/info`), the model-group endpoint is registered only at the
-// unprefixed path — every example in LiteLLM's docs uses `/model_group/info`.
-// `/v1/model_group/info` 404s, which this plugin would swallow as "endpoint
-// refused" and silently degrade to the id heuristics forever.
-const MODEL_GROUP_INFO_ENDPOINT = '/model_group/info'
-const FETCH_TIMEOUT_MS = 15000
 /**
- * Tight budget for the capability lookup. It is an optional enrichment on top
- * of /v1/models, so a slow or hanging proxy costs a few seconds at startup,
- * never the full FETCH_TIMEOUT_MS.
+ * The pricing endpoint. `/v1/model/info` and `/model/info` are the same
+ * handler; the `/v1` spelling is used because it is the documented one.
+ *
+ * NEVER `/v2/model/info`. LiteLLM v1.96.0 opened `model_info_routes` —
+ * `/model/info` and `/v1/model/info` — to `llm_api_routes`, which is what a
+ * `key_type: "llm_api"` key carries. `/v2/model/info` stayed in `info_routes`
+ * (it is the paginated Admin UI listing) and still needs an elevated key, so
+ * calling it would 403 exactly the keys this endpoint exists to serve.
  */
-const METADATA_TIMEOUT_MS = 3000
+const MODEL_INFO_ENDPOINT = '/v1/model/info'
+const FETCH_TIMEOUT_MS = 15000
 
 /**
  * Normalise a base URL so the rest of the plugin can rely on a predictable
@@ -85,48 +83,62 @@ export async function discoverLiteLLMModels(
 }
 
 /**
- * Fetch per-model-group capabilities from /model_group/info, keyed by
- * `model_group`.
+ * Does a `model_info` block carry a usable input price?
  *
- * This is where `mode` comes from — the field that says whether a model is a
- * chat model, an embedding model, a reranker, and so on. /v1/models does not
- * carry it (its response is just id/object/created/owned_by), so without this
- * the non-chat filter can only guess from the model id.
+ * The tie-breaker between two deployments of one model group: LiteLLM resolves
+ * cost per deployment, so a group whose first deployment has no `base_model`
+ * mapping and whose second one does must resolve to the second.
  *
- * Used in preference to /v1/model/info because `model_group` IS the id that
- * /v1/models reports, so no alias resolution is needed. The response DOES
- * carry per-token cost fields; they are deliberately not read. Pricing comes
- * from the price-table catalog alone, by policy: LiteLLM's numbers are only
- * right when the deployment sets `model_info.base_model`, and getting that
- * wrong silently bills $0.
- *
- * Callers MUST treat failure as non-fatal. Whether this endpoint needs an
- * elevated key is not settled — LiteLLM's own docs describe it both as a
- * discovery endpoint alongside /v1/models and as needing management access —
- * so discovery has to keep working without it.
+ * Both fields are checked because both are what `buildCost` needs: a row
+ * carrying only `input_cost_per_token` (some audio/rerank price-map entries
+ * price output per second, not per token) emits no `cost` at all, so treating
+ * it as priced would let it beat a sibling deployment that does resolve both.
  */
-export async function discoverLiteLLMModelGroups(
+function hasPrice(info: LiteLLMModelInfo | undefined): boolean {
+  return (
+    typeof info?.input_cost_per_token === 'number' &&
+    typeof info?.output_cost_per_token === 'number'
+  )
+}
+
+/**
+ * Fetch per-model pricing, limits and capabilities from /v1/model/info, keyed
+ * by `model_name` — the public model-group name, which is exactly the id
+ * /v1/models reports, so no alias resolution is needed.
+ *
+ * This is the plugin's pricing source, and also where `mode` comes from on a
+ * proxy whose /v1/models is too old to emit it.
+ *
+ * Callers MUST treat failure as non-fatal: the endpoint is only readable by a
+ * plain LLM API key from LiteLLM v1.96.0 on, and a key can still be scoped to
+ * exclude it. Models are worth injecting unpriced.
+ */
+export async function discoverLiteLLMModelInfo(
   baseURL: string,
   apiKey?: string,
   customHeaders?: Record<string, string>,
-): Promise<Map<string, LiteLLMModelGroupInfo>> {
-  const response = await fetch(buildAPIURL(baseURL, MODEL_GROUP_INFO_ENDPOINT), {
+): Promise<Map<string, LiteLLMModelInfo>> {
+  const response = await fetch(buildAPIURL(baseURL, MODEL_INFO_ENDPOINT), {
     method: 'GET',
     headers: buildHeaders(apiKey, customHeaders),
-    signal: AbortSignal.timeout(METADATA_TIMEOUT_MS),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   })
   if (!response.ok) {
     throw new Error(`LiteLLM responded with HTTP ${response.status} ${response.statusText}`)
   }
 
-  const data = (await response.json()) as LiteLLMModelGroupResponse
-  const byGroup = new Map<string, LiteLLMModelGroupInfo>()
-  for (const group of data.data ?? []) {
-    // First entry wins: a duplicate group is the same model, and the first
-    // occurrence is the one /v1/models will have reported.
-    if (group?.model_group && !byGroup.has(group.model_group)) {
-      byGroup.set(group.model_group, group)
-    }
+  const data = (await response.json()) as LiteLLMModelInfoResponse
+  const byName = new Map<string, LiteLLMModelInfo>()
+  for (const entry of data.data ?? []) {
+    const name = entry?.model_name
+    if (typeof name !== 'string' || !name) continue
+    const info = entry.model_info
+    if (!info || typeof info !== 'object') continue
+    // First priced row wins; an unpriced row only fills an empty slot, so a
+    // later priced deployment of the same group still upgrades it.
+    const existing = byName.get(name)
+    if (existing && (hasPrice(existing) || !hasPrice(info))) continue
+    byName.set(name, info)
   }
-  return byGroup
+  return byName
 }

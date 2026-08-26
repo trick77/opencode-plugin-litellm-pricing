@@ -9,21 +9,11 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createHash } from 'node:crypto'
-import { mkdtempSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import type { Config } from '@opencode-ai/plugin'
-import { resetCatalogCache, settleRefreshForTests } from '../src/catalog.ts'
-import { resetReportedCatalog } from '../src/plugin.ts'
+import { resetReportedStaleOptions } from '../src/plugin.ts'
 import {
-  PRICE_TABLE_PATHNAME,
-  PRICE_TABLE_URL,
-  PRICE_TABLE,
   captureConsole,
   fetchedURLs,
-  seedCache,
   fakePluginInput,
   json,
   loadPlugins,
@@ -45,15 +35,9 @@ async function runConfigHook(
   config: Record<string, unknown>,
   routes: Routes,
   opts: {
-    catalogProviders?: unknown[]
+    hostProviders?: unknown[]
     logged?: LoggedEntry[]
     logFails?: boolean
-    /**
-     * Put a cache on disk before the run, so a cache branch is exercised. The
-     * cache is keyed by price-table URL, so `url` has to be the one the
-     * scenario's provider will actually resolve — the default otherwise.
-     */
-    seed?: { url?: string; table: unknown; ageMs: number; v?: number }
     /**
      * Extra `config` invocations, run after the first. Each callback prepares
      * the config for the pass that follows it. opencode calls the hook once,
@@ -62,30 +46,17 @@ async function runConfigHook(
     rerun?: Array<() => void>
   } = {},
 ) {
-  resetCatalogCache()
-  resetReportedCatalog()
-  // The catalog is cached on disk between runs. Point that at a throwaway dir
-  // so the suite can neither read the developer's cache nor write to it —
-  // otherwise these scenarios pass or fail depending on the host machine.
-  process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), 'litellm-pricing-test-'))
-  if (opts.seed) {
-    await seedCache(
-      opts.seed.url ?? PRICE_TABLE_URL,
-      opts.seed.table,
-      opts.seed.ageMs,
-      opts.seed.v,
-    )
-  }
+  resetReportedStaleOptions()
   const plugin = await loadTheOnePlugin()
-  const captured = await captureConsole(() =>
+  return captureConsole(() =>
     withFakeProxy(routes, async () => {
-      const input = fakePluginInput(opts.catalogProviders ?? [], {
+      const input = fakePluginInput(opts.hostProviders ?? [], {
         logged: opts.logged,
         logFails: opts.logFails,
       })
       // Once, because that is what opencode does — measured under both
       // `opencode serve` and the CLI. There is no second pass to fall back on,
-      // which is why the price table has to be loaded before the hook runs.
+      // which is why both proxy calls are awaited inside this one.
       const hooks = await plugin(input)
       await hooks.config?.(config as unknown as Config)
       for (const prepare of opts.rerun ?? []) {
@@ -95,18 +66,9 @@ async function runConfigHook(
       return config
     }),
   )
-  // Settle any background refresh before the next scenario swaps
-  // XDG_CACHE_HOME out from under it — otherwise its cache write lands in the
-  // NEXT scenario's directory and quietly turns a no-table branch into a
-  // cache hit.
-  await settleRefreshForTests()
-  return captured
 }
 
 const PROVIDER_KEY = 'opencode-plugin-litellm-pricing'
-
-const ONE_HOUR = 60 * 60 * 1000
-const EIGHT_DAYS = 8 * 24 * ONE_HOUR
 
 /** A provider block shaped like the one the README tells users to write. */
 function providerConfig(baseURL: string, extra: Record<string, unknown> = {}) {
@@ -114,10 +76,7 @@ function providerConfig(baseURL: string, extra: Record<string, unknown> = {}) {
     provider: {
       [PROVIDER_KEY]: {
         // `npm` deliberately omitted — the plugin should default it.
-        // `catalogURL` spelled out because the plugin has no default: a
-        // provider without one is injected unpriced, which is its own scenario
-        // below rather than the baseline every other scenario builds on.
-        options: { baseURL, apiKey: 'sk-test', catalogURL: PRICE_TABLE_URL },
+        options: { baseURL, apiKey: 'sk-test' },
         ...extra,
       } as Record<string, unknown>,
     },
@@ -126,8 +85,46 @@ function providerConfig(baseURL: string, extra: Record<string, unknown> = {}) {
 
 const CHAT_MODEL = { id: 'ai-gateway-gpt-5.4', object: 'model' }
 
-function modelsResponse(...ids: Array<{ id: string; object: string }>) {
+function modelsResponse(...ids: Array<Record<string, unknown>>) {
   return json({ object: 'list', data: ids })
+}
+
+/** The priced info block the scenarios below expect to see come back out. */
+const GPT_54_INFO = {
+  mode: 'chat',
+  max_input_tokens: 1050000,
+  max_output_tokens: 128000,
+  input_cost_per_token: 0.0000025,
+  output_cost_per_token: 0.000015,
+  cache_read_input_token_cost: 0.00000025,
+  input_cost_per_token_above_200k_tokens: 0.000005,
+  output_cost_per_token_above_200k_tokens: 0.0000225,
+  cache_read_input_token_cost_above_200k_tokens: 0.0000005,
+  supports_function_calling: true,
+}
+
+const GPT_54_COST = {
+  input: 2.5,
+  output: 15,
+  cache_read: 0.25,
+  context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
+}
+
+/** A /v1/model/info route serving one row per (name, info) pair. */
+function modelInfoRoute(...rows: Array<[string, Record<string, unknown>]>) {
+  return () => json({ data: rows.map(([model_name, model_info]) => ({ model_name, model_info })) })
+}
+
+const PROXY_ROUTES: Routes = {
+  '/v1/models': () => modelsResponse(CHAT_MODEL),
+  '/v1/model/info': modelInfoRoute(['ai-gateway-gpt-5.4', GPT_54_INFO]),
+}
+
+function costOf(result: Record<string, unknown>, id = 'ai-gateway-gpt-5.4'): unknown {
+  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
+    PROVIDER_KEY
+  ]!.models
+  return (models[id] as Record<string, unknown>).cost
 }
 
 // 1 — the loader contract. This is the regression test: 0.2.0 re-exported a
@@ -152,29 +149,9 @@ test('the entry module satisfies opencode\'s plugin loader', async () => {
 })
 
 // 2 — the happy path, all the way through.
-test('injects discovered models with catalog pricing into the config', async () => {
+test('injects discovered models with proxy pricing into the config', async () => {
   const config = providerConfig('https://proxy-inject.test/v1')
-  const { logs } = await runConfigHook(
-    config,
-    {
-      '/v1/models': () => modelsResponse(CHAT_MODEL),
-      '/model_group/info': () =>
-        json({
-          data: [
-            {
-              model_group: 'ai-gateway-gpt-5.4',
-              mode: 'chat',
-              max_input_tokens: 1050000,
-              max_output_tokens: 128000,
-              supports_function_calling: true,
-            },
-          ],
-        }),
-    },
-    // Priced from a seeded cache: nothing ships in the package, so the cache
-    // is the only thing that can price a start.
-    { seed: { table: PRICE_TABLE, ageMs: ONE_HOUR } },
-  )
+  const { logs } = await runConfigHook(config, PROXY_ROUTES)
 
   const provider = config.provider[PROVIDER_KEY]!
   assert.equal(provider.npm, '@ai-sdk/openai-compatible', 'npm should be defaulted')
@@ -184,15 +161,9 @@ test('injects discovered models with catalog pricing into the config', async () 
   assert.ok(entry, 'the chat model should be injected')
   assert.equal(entry.name, 'AI Gateway GPT 5.4')
   assert.deepEqual(entry.limit, { context: 1050000, output: 128000 })
-  // Priced from the price table by name-match, never from the proxy. No
-  // cache_write: the table states none, and an absent tier is omitted rather
-  // than reported as free.
-  assert.deepEqual(entry.cost, {
-    input: 2.5,
-    output: 15,
-    cache_read: 0.25,
-    context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
-  })
+  // Priced from LiteLLM's own resolved numbers. No cache_write: the proxy
+  // states none, and an absent tier is omitted rather than reported as free.
+  assert.deepEqual(entry.cost, GPT_54_COST)
   assert.equal(entry.tool_call, true)
 
   assert.ok(
@@ -201,20 +172,30 @@ test('injects discovered models with catalog pricing into the config', async () 
   )
 })
 
+// 2b — the endpoint contract. /v2/model/info is the Admin UI listing and still
+// needs an elevated key, so calling it would 403 exactly the keys this plugin
+// is built for. Nothing outside the configured proxy may be fetched either.
+test('only /v1/models and /v1/model/info are ever fetched', async () => {
+  await runConfigHook(providerConfig('https://proxy-endpoints.test/v1'), PROXY_ROUTES)
+
+  assert.deepEqual(
+    fetchedURLs,
+    ['https://proxy-endpoints.test/v1/models', 'https://proxy-endpoints.test/v1/model/info'],
+    'the plugin must talk to the configured proxy and nothing else',
+  )
+})
+
 // 3 — LiteLLM's own `mode` filters non-chat models. The id here is
 // deliberately neutral: a name like `…-text-embedding-3-small` would be
 // filtered by the id heuristics too, which would not prove the mode path ran.
-test('non-chat models are filtered out by /model_group/info mode', async () => {
+test('non-chat models are filtered out by /v1/model/info mode', async () => {
   const config = providerConfig('https://proxy-mode.test/v1')
   const { logs } = await runConfigHook(config, {
     '/v1/models': () => modelsResponse(CHAT_MODEL, { id: 'house-vectorizer', object: 'model' }),
-    '/model_group/info': () =>
-      json({
-        data: [
-          { model_group: 'ai-gateway-gpt-5.4', mode: 'chat' },
-          { model_group: 'house-vectorizer', mode: 'embedding' },
-        ],
-      }),
+    '/v1/model/info': modelInfoRoute(
+      ['ai-gateway-gpt-5.4', GPT_54_INFO],
+      ['house-vectorizer', { mode: 'embedding' }],
+    ),
   })
 
   const models = config.provider[PROVIDER_KEY]!.models as Record<string, unknown>
@@ -230,23 +211,11 @@ test('the pre-rename provider id is still matched', async () => {
   const config = {
     provider: {
       'opencode-litellm-pricing': {
-        options: {
-          baseURL: 'https://proxy-legacy-id.test/v1',
-          apiKey: 'sk-test',
-          catalogURL: PRICE_TABLE_URL,
-        },
+        options: { baseURL: 'https://proxy-legacy-id.test/v1', apiKey: 'sk-test' },
       } as Record<string, unknown>,
     },
   }
-  await runConfigHook(
-    config,
-    {
-      '/v1/models': () => modelsResponse(CHAT_MODEL),
-      '/model_group/info': () =>
-        json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
-    },
-    { seed: { table: PRICE_TABLE, ageMs: ONE_HOUR } },
-  )
+  await runConfigHook(config, PROXY_ROUTES)
 
   const models = config.provider['opencode-litellm-pricing']!.models as Record<
     string,
@@ -256,12 +225,7 @@ test('the pre-rename provider id is still matched', async () => {
   assert.ok(entry, 'the legacy provider id should still be enriched')
   // Pricing specifically — a matched-but-unpriced entry would be the silent
   // half-failure this guarantee exists to rule out.
-  assert.deepEqual(entry.cost, {
-    input: 2.5,
-    output: 15,
-    cache_read: 0.25,
-    context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
-  })
+  assert.deepEqual(entry.cost, GPT_54_COST)
 })
 
 // 3c — matching must not have become a free-for-all.
@@ -308,64 +272,84 @@ test('a proxy that cannot be reached is survivable', async () => {
   )
 })
 
-// 6 — /model_group/info is best-effort: some keys are not allowed to call it.
-test('discovery still works when /model_group/info is refused', async () => {
-  const config = providerConfig('https://proxy-nogroups.test/v1')
-  const { logs } = await runConfigHook(config, {
+// 6 — /v1/model/info is best-effort: a proxy older than LiteLLM v1.96.0, or a
+// key scoped to exclude the route, refuses it. Losing pricing must not cost
+// the models themselves.
+test('discovery still works when /v1/model/info is refused', async () => {
+  const config = providerConfig('https://proxy-noinfo.test/v1')
+  const { logs, warns } = await runConfigHook(config, {
     '/v1/models': () =>
       modelsResponse(CHAT_MODEL, { id: 'ai-gateway-text-embedding-3-small', object: 'model' }),
-    '/model_group/info': () => json({ error: 'forbidden' }, 403),
+    '/v1/model/info': () => json({ error: 'forbidden' }, 403),
   })
 
-  const models = config.provider[PROVIDER_KEY]!.models as Record<string, unknown>
-  assert.ok(models['ai-gateway-gpt-5.4'], 'the chat model should still be injected')
+  const models = config.provider[PROVIDER_KEY]!.models as Record<string, Record<string, unknown>>
+  const entry = models['ai-gateway-gpt-5.4']
+  assert.ok(entry, 'the chat model should still be injected')
+  assert.equal(entry.cost, undefined, 'no info block means no cost, never a guessed one')
   // No `mode` available, so this one is caught by the id heuristics instead.
   assert.equal(models['ai-gateway-text-embedding-3-small'], undefined)
-  // The refusal is not reported: the id heuristics are a normal fallback,
-  // and the summary still accounts for the model it hid.
+
+  // Nothing priced at all is the systematic-failure shape, so it warns — and
+  // names the cause, because "0 priced" alone sends people looking at their
+  // model config rather than at their LiteLLM version.
+  const summary = warns.find((l) => l.includes('1 models, 0 priced, 1 hidden'))
+  assert.ok(summary, `expected the zero-coverage summary to warn, got: ${warns.join(' | ')}`)
   assert.ok(
-    logs.some((l) => l.includes('1 models, 1 priced, 1 hidden')),
-    `expected the model still summarised, got: ${logs.join(' | ')}`,
+    summary.includes('v1.96.0'),
+    `the summary should name the version that fixes it: ${summary}`,
   )
+  // And the unpriced model is named, so the gap is diagnosable from the log.
   assert.ok(
-    !logs.some((l) => l.includes('model_group')),
-    `the refused capability lookup should not be reported: ${logs.join(' | ')}`,
+    logs.some((l) => l.includes('no pricing: ai-gateway-gpt-5.4')),
+    `expected the unpriced model named, got: ${logs.join(' | ')}`,
   )
 })
 
-// 6b — the whole point of reading `mode` from the catalog: a key that cannot
-// call /model_group/info still classifies correctly.
-test('the catalog mode hides a non-chat model the id heuristics cannot name', async () => {
-  const config = providerConfig('https://proxy-catalogmode.test/v1')
-  const { logs } = await runConfigHook(config, {
+// 6b — current LiteLLM emits `mode` on /v1/models itself, so a key that cannot
+// read /v1/model/info loses pricing but keeps the non-chat filter — including
+// for the models no id heuristic can name.
+test('the mode on /v1/models still filters when /v1/model/info is refused', async () => {
+  const config = providerConfig('https://proxy-modeonly.test/v1')
+  const { warns } = await runConfigHook(config, {
     '/v1/models': () =>
-      modelsResponse(CHAT_MODEL, { id: 'ai-gateway-veo-3.1', object: 'model' }),
-    // The default for a `key_type: "llm_api"` key — LiteLLM gives it
-    // `allowed_routes: ["llm_api_routes"]`, and this route is not in that list.
-    '/model_group/info': () => json({ error: 'forbidden' }, 403),
-    [PRICE_TABLE_PATHNAME]: () =>
-      json({
-        ...PRICE_TABLE,
-        // An enriched table, carrying the gateway's own model name — the
-        // documented reason to point catalogURL at your own copy.
-        'ai-gateway-veo-3.1': { litellm_provider: 'azure', mode: 'video_generation' },
-      }),
+      modelsResponse(
+        { ...CHAT_MODEL, mode: 'chat' },
+        { id: 'ai-gateway-veo-3.1', object: 'model', mode: 'video_generation' },
+      ),
+    '/v1/model/info': () => json({ error: 'forbidden' }, 403),
   })
 
   const models = config.provider[PROVIDER_KEY]!.models as Record<string, unknown>
   assert.ok(models['ai-gateway-gpt-5.4'], 'the chat model should still be injected')
-  // Nothing in `veo` says "video" to the id heuristics. Only the catalog knows.
+  // Nothing in `veo` says "video" to the id heuristics. Only `mode` knows.
   assert.equal(
     models['ai-gateway-veo-3.1'],
     undefined,
-    'the video generator should have been filtered out by its catalog mode',
+    'the video generator should have been filtered out by its mode',
   )
-  // The filtering is not narrated — the model simply does not appear, and the
-  // summary counts it as hidden.
+  // Nothing priced (no info block), so the summary warns — but it still has to
+  // account for the model it hid.
   assert.ok(
-    logs.some((l) => l.includes('1 models, 1 priced, 1 hidden')),
-    `expected the hidden model counted, got: ${logs.join(' | ')}`,
+    warns.some((l) => l.includes('1 models, 0 priced, 1 hidden')),
+    `expected the hidden model counted, got: ${warns.join(' | ')}`,
   )
+})
+
+// 6c — the multi-deployment case, end to end. LiteLLM resolves cost per
+// deployment, so a group whose first row has no base_model mapping and whose
+// second one does must be priced from the second.
+test('a model group listed twice is priced from the deployment that resolved', async () => {
+  const config = providerConfig('https://proxy-dupes.test/v1')
+  const { result } = await runConfigHook(config, {
+    '/v1/models': () => modelsResponse(CHAT_MODEL),
+    '/v1/model/info': modelInfoRoute(
+      ['ai-gateway-gpt-5.4', { mode: 'chat' }],
+      ['ai-gateway-gpt-5.4', GPT_54_INFO],
+    ),
+  })
+
+  assert.deepEqual(costOf(result), GPT_54_COST)
 })
 
 // 7 — the guarantee the README makes about hand-curated entries.
@@ -374,10 +358,7 @@ test('existing hand-curated model entries are never overwritten', async () => {
   const config = providerConfig('https://proxy-curated.test/v1', {
     models: { 'ai-gateway-gpt-5.4': curated },
   })
-  const { logs } = await runConfigHook(config, {
-    '/v1/models': () => modelsResponse(CHAT_MODEL),
-    '/model_group/info': () => json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
-  })
+  const { logs } = await runConfigHook(config, PROXY_ROUTES)
 
   const models = config.provider[PROVIDER_KEY]!.models as Record<string, unknown>
   assert.deepEqual(models['ai-gateway-gpt-5.4'], curated)
@@ -397,7 +378,7 @@ test('existing hand-curated model entries are never overwritten', async () => {
 // that prices nothing looks the same as a run with nothing to price. These
 // scenarios pin the numbers and the sinks.
 
-/** Three chat models plus one non-chat and one wildcard — nothing is priced. */
+/** Three chat models plus one non-chat and one wildcard. */
 const MIXED_MODELS = [
   { id: 'ai-gateway-gpt-5.4', object: 'model' },
   { id: 'some-unknown-llama-thing', object: 'model' },
@@ -405,16 +386,25 @@ const MIXED_MODELS = [
   { id: 'deepseek/*', object: 'model' },
 ]
 
+/** Only one of the two injectable models above has resolved costs. */
+const MIXED_ROUTES: Routes = {
+  '/v1/models': () => json({ data: MIXED_MODELS }),
+  '/v1/model/info': modelInfoRoute(
+    ['ai-gateway-gpt-5.4', GPT_54_INFO],
+    ['some-unknown-llama-thing', { mode: 'chat' }],
+    ['text-embedding-3-large', { mode: 'embedding' }],
+  ),
+}
+
 test('the summary accounts for every discovered model, and names the unpriced', async () => {
-  const baseURL = 'https://proxy-summary.test'
-  const { logs, warns } = await runConfigHook(providerConfig(baseURL), {
-    '/v1/models': () => json({ data: MIXED_MODELS }),
-    '/model_group/info': () => json({ data: [] }),
-  })
+  const { logs, warns } = await runConfigHook(
+    providerConfig('https://proxy-summary.test'),
+    MIXED_ROUTES,
+  )
   const all = [...logs, ...warns]
 
   // 4 discovered = 2 added + 1 non-chat + 1 wildcard, and of the 2 added only
-  // ai-gateway-gpt-5.4 has a catalog match. Both non-added reasons fold into
+  // ai-gateway-gpt-5.4 has resolved costs. Both non-added reasons fold into
   // `hidden`, so the counts still add up to everything discovered.
   assert.ok(
     all.some((l) => l.includes('2 models, 1 priced, 2 hidden')),
@@ -424,17 +414,19 @@ test('the summary accounts for every discovered model, and names the unpriced', 
     all.some((l) => l.includes('no pricing: some-unknown-llama-thing')),
     `expected the unpriced model named, got: ${all.join(' | ')}`,
   )
+  // A per-model gap is not a systematic failure: something priced, so the
+  // version hint would be wrong here.
+  assert.ok(
+    !all.some((l) => l.includes('v1.96.0')),
+    `a partial gap must not blame the LiteLLM version: ${all.join(' | ')}`,
+  )
 })
 
 test('every reported line is also written to opencode own log', async () => {
-  const baseURL = 'https://proxy-applog.test'
   const logged: LoggedEntry[] = []
   const { logs, warns } = await runConfigHook(
-    providerConfig(baseURL),
-    {
-      '/v1/models': () => json({ data: MIXED_MODELS }),
-      '/model_group/info': () => json({ data: [] }),
-    },
+    providerConfig('https://proxy-applog.test'),
+    MIXED_ROUTES,
     { logged },
   )
 
@@ -451,13 +443,9 @@ test('every reported line is also written to opencode own log', async () => {
 })
 
 test('a failing app.log never breaks config loading', async () => {
-  const baseURL = 'https://proxy-logfail.test'
   const { result } = await runConfigHook(
-    providerConfig(baseURL),
-    {
-      '/v1/models': () => json({ data: MIXED_MODELS }),
-      '/model_group/info': () => json({ data: [] }),
-    },
+    providerConfig('https://proxy-logfail.test'),
+    MIXED_ROUTES,
     { logFails: true },
   )
 
@@ -467,265 +455,47 @@ test('a failing app.log never breaks config loading', async () => {
   assert.ok(models['ai-gateway-gpt-5.4'], 'models must still be injected when logging fails')
 })
 
-test('with no table at all, the failure is reported rather than shown as $0', async () => {
-  const baseURL = 'https://proxy-nocatalog.test'
-  // The fresh-install path: no cache, nothing shipped, and no fetch anybody
-  // waits on. It has to EXPLAIN a priceless startup — an unexplained $0 is
-  // what started all of this.
-  const { logs, warns } = await runConfigHook(
-    providerConfig(baseURL),
-    {
-      '/v1/models': () => json({ data: MIXED_MODELS }),
-      '/model_group/info': () => json({ data: [] }),
-      // A table with nothing usable in it: parses, prices nothing.
-      [PRICE_TABLE_PATHNAME]: () => json({ sample_spec: { litellm_provider: 'none' } }),
-    },
-  )
-  const all = [...logs, ...warns]
-
-  assert.ok(
-    warns.some((l) => l.includes('catalog unavailable')),
-    `expected a catalog warning, got: ${all.join(' | ')}`,
-  )
-  // added > 0 with priced === 0 is the systematic-failure shape, so it warns.
-  assert.ok(
-    warns.some((l) => l.includes('2 models, 0 priced')),
-    `expected the zero-coverage summary to warn, got: ${all.join(' | ')}`,
-  )
-})
-
-test('a working catalog reports its size and source', async () => {
-  const baseURL = 'https://proxy-catalogok.test'
-  const { logs } = await runConfigHook(
-    providerConfig(baseURL),
-    {
-      '/v1/models': () => json({ data: MIXED_MODELS }),
-      '/model_group/info': () => json({ data: [] }),
-    },
-    { seed: { table: PRICE_TABLE, ageMs: ONE_HOUR } },
-  )
-
-  // This line separates "no table loaded" from "table loaded, nothing matched"
-  // — the two causes of a clean zero — and names WHICH source answered, since
-  // that is what explains a stale start.
-  assert.ok(
-    logs.some((l) => l.includes('catalog:') && l.includes('model(s) from cache')),
-    `expected a catalog line naming the source, got: ${logs.join(' | ')}`,
-  )
-})
-
-// --- where the price table comes from ---------------------------------------
+// --- dead price-table options -----------------------------------------------
 //
-// load() answers from the on-disk cache once there is one, and only the very
-// first start waits on the network. Each branch is pinned by its source
-// string: a mis-wired cache still prices correctly (by fetching every time)
-// while having silently stopped caching, so asserting "it was priced" proves
-// nothing.
-
-/** A cached table, in the trimmed flat shape writeCache stores. */
-const CACHED_TABLE = {
-  'azure/gpt-5.4': {
-    litellm_provider: 'azure',
-    max_input_tokens: 10,
-    max_output_tokens: 20,
-    input_cost_per_token: 0.00000111,
-    output_cost_per_token: 0.00000222,
-  },
-}
-
-const PROXY_ROUTES = {
-  '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
-  '/model_group/info': () => json({ data: [] }),
-}
-
-function costOf(result: Record<string, unknown>): unknown {
-  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
-    PROVIDER_KEY
-  ]!.models
-  return (models['ai-gateway-gpt-5.4'] as Record<string, unknown>).cost
-}
-
-test('a fresh cache answers, without touching the network', async () => {
-  const { result, logs } = await runConfigHook(
-    providerConfig('https://proxy-fresh.test'),
-    {
-      ...PROXY_ROUTES,
-      // Reaching the price table at all on this path is the failure.
-      [PRICE_TABLE_PATHNAME]: () => {
-        throw new Error('should not fetch when the cache is fresh')
-      },
-    },
-    { seed: { table: CACHED_TABLE, ageMs: ONE_HOUR } },
-  )
-
-  assert.deepEqual(costOf(result), { input: 1.11, output: 2.22 })
-  assert.ok(
-    logs.some((l) => l.includes('catalog:') && l.includes('from cache')),
-    `expected the cache named as source, got: ${logs.join(' | ')}`,
-  )
-  // Asserted, not merely arranged: the throwing route above proves nothing on
-  // its own, because a background refresh swallows whatever it throws.
-  assert.deepEqual(
-    fetchedURLs.filter((u) => u.includes(PRICE_TABLE_PATHNAME)),
-    [],
-    'a fresh cache must not reach the price table at all',
-  )
-})
-
-test('a stale cache still answers immediately, refreshing behind it', async () => {
-  // Week-old list prices beat making someone wait. Before this, a stale cache
-  // was only consulted AFTER the fetch had already failed — so a slow network
-  // stalled startup even though a perfectly usable table sat on disk.
-  const { result, logs } = await runConfigHook(
-    providerConfig('https://proxy-stale.test'),
-    PROXY_ROUTES,
-    { seed: { table: CACHED_TABLE, ageMs: EIGHT_DAYS } },
-  )
-
-  assert.deepEqual(costOf(result), { input: 1.11, output: 2.22 })
-  assert.ok(
-    logs.some((l) => l.includes('stale cache (refreshing)')),
-    `expected the stale-cache source, got: ${logs.join(' | ')}`,
-  )
-})
-
-test('a cache written by an older schema is discarded, not half-read', async () => {
-  // The cache holds a TRIMMED table, so its layout is tied to the fields
-  // toCatalogFields and buildCost read. Serving an old layout would quietly
-  // price nothing from a newly read field.
-  const { logs } = await runConfigHook(
-    providerConfig('https://proxy-schema.test'),
-    { ...PROXY_ROUTES, [PRICE_TABLE_PATHNAME]: () => json(PRICE_TABLE) },
-    { seed: { table: CACHED_TABLE, ageMs: ONE_HOUR, v: 0 } },
-  )
-
-  // Asserting on the SOURCE, not on "it was priced": the fetch prices this
-  // correctly either way, hiding a cache that had stopped being read.
-  assert.ok(
-    !logs.some((l) => l.includes('from cache')),
-    `expected the stale-schema cache to be discarded, got: ${logs.join(' | ')}`,
-  )
-  assert.ok(
-    logs.some((l) => l.includes('catalog:') && l.includes(PRICE_TABLE_URL)),
-    `expected the fetched table as source, got: ${logs.join(' | ')}`,
-  )
-})
-
-test('prices from the fetched price table, including the model parameters', async () => {
-  const baseURL = 'https://proxy-source.test'
-  const { result } = await runConfigHook(
-    providerConfig(baseURL),
-    {
-      '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
-      '/model_group/info': () => json({ data: [] }),
-      [PRICE_TABLE_PATHNAME]: () => json(PRICE_TABLE),
-    },
-  )
-
-  const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
-    PROVIDER_KEY
-  ]!.models
-  const entry = models['ai-gateway-gpt-5.4'] as Record<string, unknown>
-  assert.deepEqual(entry.cost, {
-    input: 2.5,
-    output: 15,
-    cache_read: 0.25,
-    context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
-  })
-  // Context size and the other model parameters ride along on the same match.
-  assert.deepEqual(entry.limit, { context: 922000, output: 128000 })
-  assert.equal(entry.tool_call, true)
-  assert.equal(entry.reasoning, true)
-  assert.equal(entry.attachment, true)
-  assert.deepEqual(entry.modalities, { input: ['text', 'image', 'pdf'], output: ['text'] })
-})
-
-test('a price-table outage costs nothing once a cache exists', async () => {
-  const baseURL = 'https://proxy-outage.test'
-  // The outage that matters is the everyday one: a table on disk, however old,
-  // and no network. Week-old list prices beat both a stall and a $0.
-  const { result, logs, warns } = await runConfigHook(
-    providerConfig(baseURL),
-    {
-      ...PROXY_ROUTES,
-      [PRICE_TABLE_PATHNAME]: () => {
-        throw new Error('network down')
-      },
-    },
-    { seed: { table: PRICE_TABLE, ageMs: EIGHT_DAYS } },
-  )
-
-  assert.deepEqual(costOf(result), {
-    input: 2.5,
-    output: 15,
-    cache_read: 0.25,
-    context_over_200k: { input: 5, output: 22.5, cache_read: 0.5 },
-  })
-  assert.ok(
-    logs.some((l) => l.includes('stale cache (refreshing)')),
-    `expected the stale-cache source, got: ${logs.join(' | ')}`,
-  )
-  // Nothing is wrong here, so nothing may warn.
-  assert.equal(warns.length, 0, `expected no warnings, got: ${warns.join(' | ')}`)
-})
-
-// --- no options.catalogURL --------------------------------------------------
-//
-// There is no default table. A provider that names none is a configuration
-// gap, and the plugin says so rather than reaching for a hardcoded third-party
-// URL — but the models are still worth having, so discovery runs anyway.
-test('without options.catalogURL, models are injected unpriced and nothing is fetched', async () => {
+// Pricing came from `options.catalogURL` (and `options.pricingURL` before it)
+// until the proxy could answer for itself. Neither is read any more. A config
+// still carrying one was written by someone who wanted pricing, so the dead key
+// is named rather than ignored — and nothing is fetched from it.
+test('a config still carrying catalogURL is told the option is dead', async () => {
   const config = {
     provider: {
       [PROVIDER_KEY]: {
-        // Everything the README asks for EXCEPT the price table.
-        options: { baseURL: 'https://proxy-nocatalogurl.test/v1', apiKey: 'sk-test' },
+        options: {
+          baseURL: 'https://proxy-staleopt.test/v1',
+          apiKey: 'sk-test',
+          catalogURL: 'https://catalog.example.com/model_prices_and_context_window.json',
+        },
       } as Record<string, unknown>,
     },
   }
-  const { logs, warns } = await runConfigHook(config, {
-    '/v1/models': () => modelsResponse(CHAT_MODEL),
-    '/model_group/info': () =>
-      json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
-    // Reaching ANY price table on this path is the failure.
-    [PRICE_TABLE_PATHNAME]: () => {
-      throw new Error('no table may be fetched when catalogURL is unset')
-    },
-  })
+  const { warns } = await runConfigHook(config, PROXY_ROUTES)
 
-  // The model is still discovered and injected — just without a cost block.
+  // Priced anyway — from the proxy, which is the whole point of the message.
   const entry = (config.provider[PROVIDER_KEY]!.models as Record<string, Record<string, unknown>>)[
     'ai-gateway-gpt-5.4'
   ]
-  assert.ok(entry, 'discovery must still run without a price table')
-  assert.equal(entry.name, 'AI Gateway GPT 5.4')
-  assert.equal(entry.cost, undefined, 'no table means no cost, never a guessed one')
+  assert.ok(entry, 'discovery must still run')
+  assert.deepEqual(entry.cost, GPT_54_COST)
 
-  // Named, actionable, and pointing at the option that fixes it.
   assert.ok(
-    warns.some((l) => l.includes('has no options.catalogURL') && l.includes(PROVIDER_KEY)),
-    `expected a named warning about the missing option, got: ${warns.join(' | ')}`,
+    warns.some((l) => l.includes('options.catalogURL') && l.includes('no longer read')),
+    `expected the dead option named, got: ${warns.join(' | ')}`,
   )
-  // Asserted rather than merely arranged: the throwing route above proves
-  // nothing on its own, since a background refresh swallows what it throws.
+  // Asserted rather than merely arranged: an unrouted path throws inside a
+  // swallowed call, so only the record proves nothing was fetched.
   assert.deepEqual(
     fetchedURLs.filter((u) => u.includes('model_prices_and_context_window')),
     [],
-    'an unset catalogURL must not fall back to a hardcoded table',
-  )
-  // And the unpriced model is named, so the gap is diagnosable from the log.
-  assert.ok(
-    logs.some((l) => l.includes('no pricing: ai-gateway-gpt-5.4')),
-    `expected the unpriced model named, got: ${logs.join(' | ')}`,
+    'a dead price-table option must never be fetched',
   )
 })
 
-// A config still carrying the pre-0.7.0 spelling is the one case where "no
-// catalogURL" alone is misleading: the operator did name a table, under the old
-// key. The key is NOT read — a silent fallback would keep two spellings alive
-// forever — so the models arrive unpriced either way, and the warning names the
-// rename instead of leaving the cause to be guessed.
-test('a config carrying only the old pricingURL key is unpriced, and the warning names the rename', async () => {
+test('the pre-0.7.0 pricingURL spelling is named too', async () => {
   const config = {
     provider: {
       [PROVIDER_KEY]: {
@@ -737,153 +507,34 @@ test('a config carrying only the old pricingURL key is unpriced, and the warning
       } as Record<string, unknown>,
     },
   }
-  const { warns } = await runConfigHook(config, {
-    '/v1/models': () => modelsResponse(CHAT_MODEL),
-    '/model_group/info': () =>
-      json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
-    [PRICE_TABLE_PATHNAME]: () => {
-      throw new Error('the old key must not be read')
-    },
-  })
+  const { warns } = await runConfigHook(config, PROXY_ROUTES)
 
-  const entry = (config.provider[PROVIDER_KEY]!.models as Record<string, Record<string, unknown>>)[
-    'ai-gateway-gpt-5.4'
-  ]
-  assert.ok(entry, 'discovery must still run')
-  assert.equal(entry.cost, undefined, 'the old key must not be honoured as a fallback')
   assert.ok(
-    warns.some((l) => l.includes('options.pricingURL') && l.includes('rename it to catalogURL')),
-    `expected the rename to be named, got: ${warns.join(' | ')}`,
-  )
-  // Nothing under the old name may be fetched either.
-  assert.deepEqual(
-    fetchedURLs.filter((u) => u.includes('model_prices_and_context_window')),
-    [],
-    'the old key must not be fetched from',
+    warns.some((l) => l.includes('options.pricingURL') && l.includes('no longer read')),
+    `expected the old spelling named, got: ${warns.join(' | ')}`,
   )
 })
 
-// --- options.catalogURL -----------------------------------------------------
-//
-// The whole point of the option: a proxy operator serves an enriched copy of
-// LiteLLM's table, carrying their own gateway model names, and those price by
-// exact key instead of by substring against the public model line.
-
-const CUSTOM_PRICING_URL = 'https://catalog.example.com/model_prices_and_context_window.json'
-const CUSTOM_PRICING_PATHNAME = '/model_prices_and_context_window.json'
-
-/** An enriched table: the gateway's own model name, priced directly. */
-const ENRICHED_TABLE = {
-  'ai-gateway-gpt-5.4': {
-    litellm_provider: 'ai-gateway',
-    max_input_tokens: 400000,
-    max_output_tokens: 100000,
-    input_cost_per_token: 0.00000333,
-    output_cost_per_token: 0.00000444,
-  },
-}
-
-/** Read back what the plugin cached for `url` — the mirror of `seedCache`. */
-async function readCacheFile(url: string): Promise<{ table: Record<string, unknown> }> {
-  const key = createHash('sha256').update(url).digest('hex').slice(0, 12)
-  const file = join(
-    process.env.XDG_CACHE_HOME!,
-    'opencode-plugin-litellm-pricing',
-    `price-table-${key}.json`,
-  )
-  return JSON.parse(await readFile(file, 'utf8')) as { table: Record<string, unknown> }
-}
-
-test('options.catalogURL is the only table fetched', async () => {
-  const { result, logs } = await runConfigHook(
-    providerConfig('https://proxy-custom.test', {
-      options: { baseURL: 'https://proxy-custom.test', apiKey: 'sk-test', catalogURL: CUSTOM_PRICING_URL },
-    }),
-    {
-      ...PROXY_ROUTES,
-      [CUSTOM_PRICING_PATHNAME]: () => json(ENRICHED_TABLE),
-      // No other table may be consulted — the configured URL is the only one.
-      [PRICE_TABLE_PATHNAME]: () => {
-        throw new Error('only the configured catalogURL may be fetched')
-      },
-    },
-  )
-
-  // The exact key wins: $3.33/$4.44, not whatever gpt-5.4 costs upstream.
-  assert.deepEqual(costOf(result), { input: 3.33, output: 4.44 })
-
-  // And it survives the round-trip through the cache. `trim` must filter by
-  // FIELD only: a provider filter there (the shape the old models.dev table
-  // needed) would drop every enriched entry on the way to disk, and the next
-  // start would price nothing while every assertion above still passed.
-  const cached = await readCacheFile(CUSTOM_PRICING_URL)
-  assert.deepEqual(cached.table['ai-gateway-gpt-5.4'], {
-    litellm_provider: 'ai-gateway',
-    max_input_tokens: 400000,
-    max_output_tokens: 100000,
-    input_cost_per_token: 0.00000333,
-    output_cost_per_token: 0.00000444,
-  })
-  // The configured URL is named as the source, and — since this table carries
-  // no azure/openai entries — the log says the substring pass is inert rather
-  // than trailing off after "substring match via ". That is exactly the state
-  // a partial table puts a user in, and it explains their coverage gap.
-  assert.ok(
-    logs.some((l) => l.includes(CUSTOM_PRICING_URL) && l.includes('exact model names only')),
-    `expected the configured URL and an empty-provider note, got: ${logs.join(' | ')}`,
-  )
-  assert.deepEqual(
-    fetchedURLs.filter((u) => u.includes(PRICE_TABLE_PATHNAME)),
-    [],
-    'only the configured catalogURL may be fetched',
-  )
-})
-
-test('the cache is keyed per price-table URL', async () => {
-  // A cache seeded for one url must never answer for a provider
-  // configured with a different one — otherwise switching tables, or running
-  // two providers against two tables, silently serves the wrong prices.
-  const { result } = await runConfigHook(
-    providerConfig('https://proxy-cachekey.test', {
-      options: {
-        baseURL: 'https://proxy-cachekey.test',
-        apiKey: 'sk-test',
-        catalogURL: CUSTOM_PRICING_URL,
-      },
-    }),
-    { ...PROXY_ROUTES, [CUSTOM_PRICING_PATHNAME]: () => json(ENRICHED_TABLE) },
-    { seed: { table: CACHED_TABLE, ageMs: ONE_HOUR } },
-  )
-
-  // $1.11/$2.22 is the other URL's cache. Seeing it here means the cache key
-  // ignored the URL.
-  assert.deepEqual(costOf(result), { input: 3.33, output: 4.44 })
+test('a provider with no dead options says nothing about them', async () => {
+  const { warns } = await runConfigHook(providerConfig('https://proxy-clean.test/v1'), PROXY_ROUTES)
+  assert.deepEqual(warns, [], `a correct config must warn about nothing: ${warns.join(' | ')}`)
 })
 
 test('an SDK without client.app.log does not lose every model', async () => {
-  const baseURL = 'https://proxy-nolog.test'
   // Older opencode builds have no /log endpoint. The property access throws
   // synchronously, which `.catch()` cannot see — and an escaped throw here
   // takes the whole config hook down with it.
-  resetCatalogCache()
-  resetReportedCatalog()
-  process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), 'litellm-pricing-test-'))
+  resetReportedStaleOptions()
   const plugin = await loadTheOnePlugin()
-  const config = providerConfig(baseURL)
+  const config = providerConfig('https://proxy-nolog.test')
   const { result } = await captureConsole(() =>
-    withFakeProxy(
-      {
-        '/v1/models': () => json({ data: [{ id: 'ai-gateway-gpt-5.4', object: 'model' }] }),
-        '/model_group/info': () => json({ data: [] }),
-      },
-      async () => {
-        const input = fakePluginInput([])
-        delete (input.client as unknown as Record<string, unknown>).app
-        const hooks = await plugin(input)
-        await hooks.config?.(config as unknown as Config)
-        return config
-      },
-    ),
+    withFakeProxy(PROXY_ROUTES, async () => {
+      const input = fakePluginInput([])
+      delete (input.client as unknown as Record<string, unknown>).app
+      const hooks = await plugin(input)
+      await hooks.config?.(config as unknown as Config)
+      return config
+    }),
   )
 
   const models = (result.provider as Record<string, { models: Record<string, unknown> }>)[
@@ -906,11 +557,7 @@ test('the SDK baseURL always carries /v1, whichever form was configured', async 
     ['https://proxy-slash.test/v1/', 'https://proxy-slash.test'],
   ] as const) {
     const config = providerConfig(configured)
-    await runConfigHook(config, {
-      '/v1/models': () => modelsResponse(CHAT_MODEL),
-      '/model_group/info': () =>
-        json({ data: [{ model_group: 'ai-gateway-gpt-5.4', mode: 'chat' }] }),
-    })
+    await runConfigHook(config, PROXY_ROUTES)
 
     const provider = config.provider[PROVIDER_KEY]!
     const options = provider.options as Record<string, unknown>
@@ -942,13 +589,10 @@ test('models we injected stay ours across repeated config passes', async () => {
     config,
     {
       '/v1/models': () => modelsResponse(CHAT_MODEL, { id: 'house-chat', object: 'model' }),
-      '/model_group/info': () =>
-        json({
-          data: [
-            { model_group: 'ai-gateway-gpt-5.4', mode: 'chat' },
-            { model_group: 'house-chat', mode: 'chat' },
-          ],
-        }),
+      '/v1/model/info': modelInfoRoute(
+        ['ai-gateway-gpt-5.4', GPT_54_INFO],
+        ['house-chat', GPT_54_INFO],
+      ),
     },
     { rerun: [dropOne, dropOne] },
   )

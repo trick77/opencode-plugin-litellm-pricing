@@ -23,11 +23,8 @@ curl -s http://127.0.0.1:7812/config/providers \
   | jq '.providers[] | select(.id=="litellm") | .models'
 ```
 
-To exercise a cold start, clear the price-table cache first:
-
-```sh
-rm -rf ~/.cache/opencode-plugin-litellm-pricing
-```
+Every start is a cold start: nothing is cached on disk, and the two proxy calls
+are all there is.
 
 ## What this exists to catch
 
@@ -37,6 +34,6 @@ rm -rf ~/.cache/opencode-plugin-litellm-pricing
   cannot answer a request while a plugin blocks on it: awaiting
   `config.providers` / `provider.list` timed out at 60 s, while the identical
   unawaited call returned in 351 ms — after the hook had already run. This is
-  why the price table is fetched over plain HTTPS instead.
+  why nothing is ever asked of opencode itself from inside the hook.
 - **Prices reaching the log is not the same as prices reaching the picker.**
   Assert against `/config/providers`, not against stdout.

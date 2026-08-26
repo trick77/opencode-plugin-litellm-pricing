@@ -2,14 +2,7 @@
 // provider.*.models.* in opencode.json) from a discovered LiteLLM model,
 // including the per-model `cost` block — the reason this plugin exists.
 
-import type {
-  CostBlock,
-  CostTier,
-  LiteLLMModel,
-  LiteLLMModelGroupInfo,
-  LiteLLMModelInfo,
-} from './types.ts'
-import type { CatalogFields } from './catalog.ts'
+import type { CostBlock, CostTier, LiteLLMModel, LiteLLMModelInfo } from './types.ts'
 import { categorizeModel, formatModelName } from './format-model-name.ts'
 
 // LiteLLM reports cost as USD per token; opencode expects USD per 1,000,000
@@ -81,44 +74,23 @@ function buildTier(
 }
 
 /**
- * Adapt a /model_group/info entry to the LiteLLMModelInfo shape so it can
- * go through the same `enrichModel` overlay.
+ * Overlay a /v1/model/info `model_info` block onto a /v1/models entry (the lean
+ * entry wins; the info block fills gaps).
  *
- * `max_tokens` is deliberately NOT mapped: the group response exposes
- * `max_input_tokens`/`max_output_tokens`, and the `max_tokens` some pages show
- * is ambiguous there. Leaving it undefined keeps the
- * `max_output_tokens ?? max_tokens` fallback honest. Cost is not mapped
- * either — the group endpoint carries none, and pricing comes from the price
- * table.
+ * On current LiteLLM /v1/models already carries `mode` and the token limits, so
+ * most of this is a no-op; on an older proxy the info block is the only source
+ * for all of it. The capability flags come from here either way.
  *
- * `null` is normalised to `undefined` so the `??` chains in `enrichModel`
- * treat a missing value as missing.
- */
-export function groupInfoToModelInfo(group: LiteLLMModelGroupInfo): LiteLLMModelInfo {
-  return {
-    mode: group.mode ?? undefined,
-    max_input_tokens: group.max_input_tokens ?? undefined,
-    max_output_tokens: group.max_output_tokens ?? undefined,
-    supports_function_calling: group.supports_function_calling,
-    supports_vision: group.supports_vision,
-    supports_reasoning: group.supports_reasoning,
-    supports_pdf_input: group.supports_pdf_input,
-    supports_audio_input: group.supports_audio_input,
-  }
-}
-
-/**
- * Overlay /model_group/info metadata onto a /v1/models entry (the lean entry
- * wins; the info block fills gaps — notably `mode`, token limits, and
- * capability flags, which /v1/models does not carry at all).
+ * `null` is normalised to `undefined` so a missing value reads as missing
+ * through the `??` chains.
  */
 export function enrichModel(model: LiteLLMModel, info: LiteLLMModelInfo): LiteLLMModel {
   return {
     ...model,
-    mode: model.mode ?? info.mode,
-    max_tokens: model.max_tokens ?? info.max_tokens,
-    max_input_tokens: model.max_input_tokens ?? info.max_input_tokens,
-    max_output_tokens: model.max_output_tokens ?? info.max_output_tokens,
+    mode: model.mode ?? info.mode ?? undefined,
+    max_tokens: model.max_tokens ?? info.max_tokens ?? undefined,
+    max_input_tokens: model.max_input_tokens ?? info.max_input_tokens ?? undefined,
+    max_output_tokens: model.max_output_tokens ?? info.max_output_tokens ?? undefined,
     supports_function_calling: model.supports_function_calling ?? info.supports_function_calling,
     supports_vision: model.supports_vision ?? info.supports_vision,
     supports_reasoning: model.supports_reasoning ?? info.supports_reasoning,
@@ -133,27 +105,19 @@ export function enrichModel(model: LiteLLMModel, info: LiteLLMModelInfo): LiteLL
  * Returns `null` for anything that isn't a chat model (embedding/image/audio/
  * rerank/moderation) so non-chat models don't clutter the picker.
  *
- * `model` should already carry whatever `/model_group/info` returned (apply it
- * with `enrichModel` first), so `categorizeModel` can classify on the proxy's
- * own `mode` first, then the id heuristics, then `fields.mode` — the catalog's
- * classification, which is the only one a key that cannot read
- * /model_group/info has.
+ * `model` should already carry whatever /v1/model/info returned (apply it with
+ * `enrichModel` first) so `categorizeModel` can classify on the proxy's own
+ * `mode` before falling back to the id heuristics.
  *
- * LiteLLM's limits and capability flags win where present; `fields` (matched
- * from the price-table catalog) supply the classification above plus cost, and
- * fill the remaining gaps; they may be null when nothing matched — the model is
- * still injected, just barer.
- * Cost is never sourced from the proxy: LiteLLM's per-model numbers depend on
- * the deployment setting `base_model` correctly, and getting that wrong bills
- * $0 silently.
+ * `info` is the same block again, and is read here only for cost. It may be
+ * undefined — a proxy older than LiteLLM v1.96.0, or a key that cannot read
+ * /v1/model/info — in which case the model is still injected, just unpriced.
  */
-export function configModelFromCatalog(
+export function configModelFromProxy(
   model: LiteLLMModel,
-  fields: CatalogFields | null,
+  info: LiteLLMModelInfo | undefined,
 ): Record<string, unknown> | null {
-  // The catalog's `mode` is classification input only — it must never reach the
-  // emitted entry, which is why applyCatalogFields below does not copy it.
-  if (categorizeModel(model, fields?.mode) !== 'chat') return null
+  if (categorizeModel(model) !== 'chat') return null
 
   const entry: Record<string, unknown> = { name: formatModelName(model) }
 
@@ -177,49 +141,7 @@ export function configModelFromCatalog(
   if (model.supports_audio_input) input.push('audio')
   if (input.length > 1) entry.modalities = { input, output: ['text'] }
 
-  if (fields) applyCatalogFields(entry, fields)
+  const cost = buildCost(info)
+  if (cost) entry.cost = cost
   return entry
-}
-
-type Modalities = { input: string[]; output: string[] }
-
-/** Copy a cost block, nested tier included — a shallow spread would alias it. */
-function cloneCost(cost: CostBlock): CostBlock {
-  const { context_over_200k, ...tier } = cost
-  return context_over_200k ? { ...tier, context_over_200k: { ...context_over_200k } } : { ...tier }
-}
-
-/**
- * Merge catalog fields into an entry, without overwriting existing keys.
- *
- * Copies rather than aliases: `catalog.resolve()` hands back the SAME
- * `CatalogFields` object for every model that matched one table entry, so
- * assigning it directly would put one shared cost/limit object into several
- * places in opencode's config tree.
- */
-export function applyCatalogFields(entry: Record<string, unknown>, fields: CatalogFields): void {
-  if (fields.cost && !entry.cost) entry.cost = cloneCost(fields.cost)
-  if (fields.limit && !entry.limit) entry.limit = { ...fields.limit }
-  if (fields.reasoning && entry.reasoning == null) entry.reasoning = true
-  if (fields.tool_call && entry.tool_call == null) entry.tool_call = true
-  if (fields.attachment && entry.attachment == null) entry.attachment = true
-  // Union, never replace: LiteLLM's capability flags are sparse (a group that
-  // reports only `supports_vision` would otherwise shrink a catalog entry that
-  // knew about pdf/audio down to text+image).
-  if (fields.modalities) mergeModalities(entry, fields.modalities)
-}
-
-/** Merge catalog modalities into an entry's, keeping every input already listed. */
-function mergeModalities(entry: Record<string, unknown>, fromCatalog: Modalities): void {
-  const existing = entry.modalities as Modalities | undefined
-  if (!existing) {
-    // Copied, not aliased — see applyCatalogFields.
-    entry.modalities = { input: [...fromCatalog.input], output: [...fromCatalog.output] }
-    return
-  }
-  const input = [...existing.input]
-  for (const modality of fromCatalog.input) {
-    if (!input.includes(modality)) input.push(modality)
-  }
-  entry.modalities = { input, output: existing.output }
 }
