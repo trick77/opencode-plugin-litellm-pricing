@@ -38,6 +38,3 @@ Desktop.ini
 .codex/
 .goose/
 .opencode/
-
-# Local git worktrees
-.agents/worktrees/
