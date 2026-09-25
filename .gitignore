@@ -30,6 +30,7 @@ Desktop.ini
 
 # agentic coding tools (per-project state, often contains chat logs)
 .claude/
+.agents/
 .cursor/
 .aider*
 .continue/
