@@ -26,8 +26,13 @@ const MODEL_INFO = {
         max_output_tokens: 128000,
         input_cost_per_token: 0.0000025,
         output_cost_per_token: 0.000015,
+        cache_read_input_token_cost: 0.00000025,
+        // Exercises the V2 >200k context tier.
+        input_cost_per_token_above_200k_tokens: 0.000005,
+        output_cost_per_token_above_200k_tokens: 0.0000225,
         supports_function_calling: true,
         supports_vision: true,
+        supports_reasoning: true,
       },
     },
     {
@@ -49,7 +54,12 @@ const MODEL_INFO = {
   ],
 }
 
+const PORT = Number(process.env.PORT ?? 7801)
+
 createServer((req, res) => {
+  // Proves which key reached the proxy: opencode substitutes `{env:…}` in
+  // settings before the plugin reads them.
+  console.error(`${req.method} ${req.url} auth=${req.headers.authorization ?? '-'}`)
   res.setHeader('content-type', 'application/json')
   // Checked first: `/v1/model/info` also starts with `/v1/model`.
   if (req.url?.startsWith('/v1/model/info')) {
@@ -64,4 +74,4 @@ createServer((req, res) => {
   // because LiteLLM still gates it behind an elevated key.
   res.statusCode = 404
   res.end('{}')
-}).listen(7801, '127.0.0.1')
+}).listen(PORT, '127.0.0.1')

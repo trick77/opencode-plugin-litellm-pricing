@@ -1,15 +1,15 @@
 # opencode-plugin-litellm-pricing
 
-An [OpenCode](https://opencode.ai) plugin that lists the models on a
-[LiteLLM](https://litellm.ai) proxy at startup and injects them into the model
-picker with a per-model `cost` block, so OpenCode shows real pricing instead of
-`$0`.
+An [OpenCode](https://opencode.ai) 2 plugin that lists the models on a
+[LiteLLM](https://litellm.ai) proxy and adds them to the model picker with
+per-model `cost` tiers, so OpenCode shows real pricing instead of `$0`.
 
 Everything comes from the proxy itself: `/v1/models` for the model list,
 `/v1/model/info` for each model's price, kind, limits and capabilities. One URL
 to configure, nothing fetched that you did not point it at, no local cache.
 
-Requires **LiteLLM v1.96.0 or newer** — see [Requirements](#requirements).
+Requires **OpenCode 2** and **LiteLLM v1.96.0 or newer** — see
+[Requirements](#requirements).
 
 ## Install
 
@@ -18,9 +18,28 @@ Add the plugin and a LiteLLM provider to your `opencode.json`:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-plugin-litellm-pricing@latest"],
+  "plugins": ["opencode-plugin-litellm-pricing@1.0.0"],
+  "providers": {
+    "litellm": {
+      "name": "LiteLLM (proxy)",
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "settings": {
+        "baseURL": "https://litellm.example.com/v1",
+        "apiKey": "{env:LITELLM_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+An OpenCode 1-style block works unchanged — OpenCode 2 normalizes it to the
+shape above before the plugin sees it:
+
+```json
+{
+  "plugins": ["opencode-plugin-litellm-pricing@1.0.0"],
   "provider": {
-    "opencode-plugin-litellm-pricing": {
+    "litellm": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "LiteLLM (proxy)",
       "options": {
@@ -32,26 +51,50 @@ Add the plugin and a LiteLLM provider to your `opencode.json`:
 }
 ```
 
-`options.baseURL` is required; a provider without one is skipped with a warning.
-The key is read from `options.apiKey`, else `$LITELLM_API_KEY` /
-`$LITELLM_MASTER_KEY`. Extra auth headers (e.g. Cloudflare Access) go in
-`options.customHeaders`.
+`settings.baseURL` (`options.baseURL`) is required; a provider without one is
+skipped with a warning. Without `/v1` works too — the plugin puts it back for
+the model calls. The key is read from `settings.apiKey`, else
+`$LITELLM_API_KEY` / `$LITELLM_MASTER_KEY`; an unset `{env:VAR}` counts as no
+key. Request headers in the provider's `headers` (V1: `options.headers`) and
+in `settings.customHeaders` are also sent to the proxy's discovery endpoints,
+e.g. for Cloudflare Access.
 
-Upgrading from 0.8.0 or earlier: delete `options.catalogURL` (or the older
-`options.pricingURL`). Neither is read any more, and a config still carrying one
-gets a warning saying so.
+Discovery runs in the background once OpenCode has loaded the provider, and
+again whenever its URL, key or headers change. The very first model list a
+freshly started OpenCode serves can come back before the proxy has answered;
+the models are there from the next request on. A proxy that is down (or
+answers with no models) is retried once a minute until it answers; a proxy
+that answered is not polled again until the provider's settings change.
+
+### Upgrading
+
+- **From 0.x (OpenCode 1):** 1.0.0 runs on OpenCode 2 only — OpenCode 1 cannot
+  load it, stay on 0.9.0 there. Rename `plugin` to `plugins` and pin
+  `@1.0.0`; the provider block needs no change.
+- **From 0.8.0 or earlier:** delete `options.catalogURL` (or the older
+  `options.pricingURL`). Neither is read any more, and a config still carrying
+  one gets a warning saying so.
 
 ## How pricing works
 
-Each chat-capable model is injected with a config entry like:
+Each chat-capable model is added to the provider with fields like:
 
 ```json
 {
   "name": "AI Gateway GPT 5.4",
   "limit": { "context": 1050000, "output": 128000 },
-  "cost":  { "input": 2.5, "output": 15, "cache_read": 0.25 }
+  "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
+  "cost": [
+    { "input": 2.5, "output": 15, "cache": { "read": 0.25, "write": 0 } },
+    { "tier": { "type": "context", "size": 200000 },
+      "input": 5, "output": 22.5, "cache": { "read": 0.5, "write": 0 } }
+  ]
 }
 ```
+
+Models LiteLLM marks `supports_reasoning` get `low` / `medium` / `high`
+variants that set `reasoningEffort`, the same ones OpenCode derives for any
+OpenAI-compatible reasoning model.
 
 Cost, limits and capabilities come from `/v1/model/info`, keyed by `model_name`
 — the same string `/v1/models` reports, so no name matching is involved. These
@@ -60,16 +103,19 @@ included, so what OpenCode displays is what the gateway bills. They are stated
 per token and converted to OpenCode's per-1M units.
 
 Where a model group has several deployments, the one that resolved a price wins.
-Models the proxy reports no cost for are injected **without** a `cost` block
+Models the proxy reports no cost for are injected **without** cost tiers
 rather than with a wrong one — usually a deployment whose `base_model` is unset
-or misspelled, so LiteLLM cannot map it to a price-map entry. The startup log
-names them. Wildcard (`*`) entries are skipped; they are access rules, not
-models. Entries you have hand-curated under `provider.*.models` are never
-overwritten.
+or misspelled, so LiteLLM cannot map it to a price-map entry. The discovery
+log names them. Wildcard (`*`) entries are skipped; they are access rules, not
+models. Entries you have hand-curated under `providers.*.models` (V1:
+`provider.*.models`) are never overwritten.
 
-Tiered pricing: opencode models a single `context_over_200k` tier, mapped from
-LiteLLM's `*_above_200k_tokens` fields. `*_above_272k_tokens` is not mapped,
-since forcing it into the 200k bucket would overcharge everything in between.
+OpenCode 2 requires both cache prices on every tier; one the proxy does not
+state is written as `0`, as OpenCode's own config migration does.
+
+Tiered pricing: LiteLLM's `*_above_200k_tokens` fields become a second tier
+sized 200k. `*_above_272k_tokens` is not mapped, since forcing it into the 200k
+bucket would overcharge everything in between.
 
 ## Non-chat models
 
@@ -84,13 +130,15 @@ If neither call reports a mode — an older proxy, or a key that cannot read
 false positive hides a usable model; the trade-off is that an oddly named
 non-chat model can slip through.
 
-## The startup log
+## The discovery log
 
-Messages go to the opencode server's stdout and to
-`~/.local/share/opencode/log/opencode.log`:
+OpenCode 2 gives plugins no logger, so messages go to the server's stdout only.
+They do **not** reach `~/.local/share/opencode/log/opencode.log`, and the
+background service (`opencode service`) discards them. To read them, run a
+server in the foreground and watch its output:
 
-```
-grep litellm-pricing ~/.local/share/opencode/log/opencode.log
+```sh
+opencode serve --port 4097
 ```
 
 A healthy run:
@@ -103,7 +151,8 @@ A healthy run:
 `34 models` is what reached the picker, `31 priced` how many of those carry
 cost, and `7 hidden` everything the proxy offered that was not injected —
 non-chat models, wildcard access rules, and ids already in your config.
-Unpriced models are named, not just counted.
+Unpriced models are named, not just counted. Printed once per discovery, per
+OpenCode location.
 
 `N models, 0 priced` is logged as a warning. Nothing priced at all almost always
 means the pricing endpoint could not be read, and the line says so:
@@ -118,16 +167,17 @@ per-deployment `base_model` gaps, not a version problem.
 
 ## Provider matching
 
-A provider is enriched if its id is `opencode-plugin-litellm-pricing` (the
-default), `opencode-litellm-pricing`, or `litellm`; if it starts with
-`litellm-` / `litellm_`; or if its `options` sets `litellm: true` (or
-`litellmCompatible` / `litellm-compatible`). With no matching provider the
-plugin does nothing.
+A provider is enriched if its id is `opencode-plugin-litellm-pricing`,
+`opencode-litellm-pricing`, or `litellm`; if it starts with `litellm-` /
+`litellm_`; or if its `settings` (V1: `options`) sets `litellm: true` (or
+`litellmCompatible` / `litellm-compatible` / `litellm_compatible`). With no
+matching provider the plugin does nothing.
 
 ## Requirements
 
-- OpenCode with plugin support
-- Node 22+
+- OpenCode 2 (tested on 2.0.32). OpenCode 1 needs 0.9.0.
+- Node 22+ (development only — OpenCode runs the plugin itself)
+- No runtime dependencies: `@opencode/plugin` is used for types only.
 - A reachable LiteLLM proxy, **v1.96.0 or newer**. That release moved
   `/model/info` and `/v1/model/info` into `llm_api_routes`, so an ordinary
   virtual key can read pricing; before it, only a key with admin-shaped

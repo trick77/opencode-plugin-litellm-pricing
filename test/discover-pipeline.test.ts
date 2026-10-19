@@ -1,8 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { discoverLiteLLMModelInfo } from '../src/litellm-api.ts'
-import { configModelFromProxy, enrichModel } from '../src/build-config-model.ts'
-import type { LiteLLMModel, LiteLLMModelInfo } from '../src/types.ts'
+import { enrichModel, modelSpecFromProxy } from '../src/build-model.ts'
+import type { LiteLLMModel, LiteLLMModelInfo, ModelSpec } from '../src/types.ts'
 
 // Shaped after LiteLLM's /v1/model/info response: one row per deployment,
 // keyed by model_name (the same string /v1/models reports as an id), each
@@ -56,15 +56,18 @@ function mockFetchStatus(status: number, statusText: string) {
   }
 }
 
-/** The live path: enrich with the info block where present, then build the entry. */
+/** The live path: enrich with the info block where present, then build the spec. */
 function inject(
   model: LiteLLMModel,
   infoByName: Map<string, LiteLLMModelInfo> | null,
-): Record<string, unknown> | null {
+): ModelSpec | null {
   const info = infoByName?.get(model.id)
   const enriched = info ? enrichModel(model, info) : model
-  return configModelFromProxy(enriched, info)
+  return modelSpecFromProxy(enriched, info)
 }
+
+/** A V2 base tier with unknown cache prices. */
+const tier = (input: number, output: number) => ({ input, output, cache: { read: 0, write: 0 } })
 
 test('model info keys by model_name — the same id /v1/models reports', async () => {
   const calls: string[] = []
@@ -97,17 +100,17 @@ test('mode filters non-chat models that no name heuristic would catch', async ()
   }
 })
 
-test('model info supplies cost, limits and capabilities to the injected entry', async () => {
+test('model info supplies cost, limits and capabilities to the injected spec', async () => {
   const restore = mockFetchOnce(MODEL_INFO_FIXTURE)
   try {
     const infoByName = await discoverLiteLLMModelInfo('http://proxy')
     const entry = inject({ id: 'ai-gateway-gpt-5.4', object: 'model' }, infoByName)!
     assert.deepEqual(entry.limit, { context: 1050000, output: 128000 })
-    assert.equal(entry.tool_call, true)
+    assert.equal(entry.tools, true)
     assert.equal(entry.reasoning, true)
-    assert.equal(entry.attachment, true)
+    assert.deepEqual(entry.input, ['text', 'image'])
     // Per-token USD scaled to per-million.
-    assert.deepEqual(entry.cost, { input: 2.5, output: 15 })
+    assert.deepEqual(entry.cost, [tier(2.5, 15)])
   } finally {
     restore()
   }
@@ -121,8 +124,8 @@ test('a deployment with no resolved cost injects unpriced, not at $0', async () 
     const infoByName = await discoverLiteLLMModelInfo('http://proxy')
     const entry = inject({ id: 'byo-llama', object: 'model' }, infoByName)!
     // A missing base_model mapping means LiteLLM resolves no cost fields at
-    // all. Omitting `cost` is the honest answer; a 0 would read as free.
-    assert.equal(entry.cost, undefined)
+    // all. No tier is the honest answer; a 0 would read as free.
+    assert.deepEqual(entry.cost, [])
     assert.equal(entry.name, 'Byo Llama')
   } finally {
     restore()
@@ -145,7 +148,7 @@ test('a priced deployment wins over an unpriced one in the same model group', as
     const infoByName = await discoverLiteLLMModelInfo('http://proxy')
     assert.equal(infoByName.size, 1)
     const entry = inject({ id: 'ai-gateway-gpt-5.4', object: 'model' }, infoByName)!
-    assert.deepEqual(entry.cost, { input: 1, output: 2 })
+    assert.deepEqual(entry.cost, [tier(1, 2)])
   } finally {
     restore()
   }
@@ -164,7 +167,7 @@ test('a later unpriced deployment does not clobber the priced one', async () => 
   try {
     const infoByName = await discoverLiteLLMModelInfo('http://proxy')
     const entry = inject({ id: 'ai-gateway-gpt-5.4', object: 'model' }, infoByName)!
-    assert.deepEqual(entry.cost, { input: 1, output: 2 })
+    assert.deepEqual(entry.cost, [tier(1, 2)])
   } finally {
     restore()
   }
@@ -185,7 +188,7 @@ test('a row priced on input alone does not beat a fully priced deployment', asyn
   try {
     const infoByName = await discoverLiteLLMModelInfo('http://proxy')
     const entry = inject({ id: 'ai-gateway-gpt-5.4', object: 'model' }, infoByName)!
-    assert.deepEqual(entry.cost, { input: 1, output: 2 })
+    assert.deepEqual(entry.cost, [tier(1, 2)])
   } finally {
     restore()
   }
@@ -215,7 +218,7 @@ test('a refused /v1/model/info falls open — models still inject, unpriced', as
   // With infoByName = null the pipeline classifies by id: chat stays, embedding goes.
   const chat = inject({ id: 'ai-gateway-gpt-5.4', object: 'model' }, null)
   assert.notEqual(chat, null)
-  assert.equal(chat!.cost, undefined)
+  assert.deepEqual(chat!.cost, [])
   assert.equal(inject({ id: 'text-embedding-3-large', object: 'model' }, null), null)
   // ...and the reranker no name heuristic would catch is the cost of falling open.
   assert.notEqual(inject({ id: 'acme-ranker', object: 'model' }, null), null)
@@ -227,5 +230,5 @@ test('a refused /v1/model/info still classifies by the mode on /v1/models', () =
   assert.equal(inject({ id: 'acme-ranker', object: 'model', mode: 'rerank' }, null), null)
   const chat = inject({ id: 'acme-thinker', object: 'model', mode: 'chat' }, null)
   assert.notEqual(chat, null)
-  assert.equal(chat!.cost, undefined)
+  assert.deepEqual(chat!.cost, [])
 })

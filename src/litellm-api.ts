@@ -53,6 +53,15 @@ export function resolveApiKey(explicit?: string): string | undefined {
   return explicit ?? process.env.LITELLM_API_KEY ?? process.env.LITELLM_MASTER_KEY
 }
 
+/**
+ * Every request is bounded by the timeout, and also stops when the caller's
+ * signal fires — the plugin aborts in-flight discovery when it is unloaded.
+ */
+function bounded(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS)
+  return signal ? AbortSignal.any([timeout, signal]) : timeout
+}
+
 function buildHeaders(
   apiKey?: string,
   customHeaders?: Record<string, string>,
@@ -69,11 +78,12 @@ export async function discoverLiteLLMModels(
   baseURL: string,
   apiKey?: string,
   customHeaders?: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<LiteLLMModel[]> {
   const response = await fetch(buildAPIURL(baseURL), {
     method: 'GET',
     headers: buildHeaders(apiKey, customHeaders),
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    signal: bounded(signal),
   })
   if (!response.ok) {
     throw new Error(`LiteLLM responded with HTTP ${response.status} ${response.statusText}`)
@@ -117,11 +127,12 @@ export async function discoverLiteLLMModelInfo(
   baseURL: string,
   apiKey?: string,
   customHeaders?: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<Map<string, LiteLLMModelInfo>> {
   const response = await fetch(buildAPIURL(baseURL, MODEL_INFO_ENDPOINT), {
     method: 'GET',
     headers: buildHeaders(apiKey, customHeaders),
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    signal: bounded(signal),
   })
   if (!response.ok) {
     throw new Error(`LiteLLM responded with HTTP ${response.status} ${response.statusText}`)

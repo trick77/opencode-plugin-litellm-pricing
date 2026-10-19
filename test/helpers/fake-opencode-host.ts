@@ -1,161 +1,278 @@
-// A fake opencode host: enough of the real thing to run this plugin end to
+// A fake opencode V2 host: enough of the real thing to run this plugin end to
 // end in a test, without opencode and without a LiteLLM proxy.
 //
 // Not a test file — `npm test` globs `test/*.test.ts`, so nothing under
 // `test/helpers/` is collected as a suite.
 //
-// Why this exists: 0.2.0 shipped a plugin that opencode refused to load
-// ("Plugin export is not a function") while `tsc` and the whole unit suite
-// stayed green. The plugin *function* was fine; the entry module's export
-// shape was not, and only opencode's loader loop observes that. A harness
-// that imported `LiteLLMPricingPlugin` by name and called it would have
-// passed the broken build. So `loadPlugins` below reproduces the loader
-// rule instead of approximating it.
+// Modelled on opencode 2.0.32 (packages/core/src/provider.ts,
+// packages/core/src/config/plugin/provider.ts, packages/core/src/plugin/module.ts).
+// What is faked, and how it can drift from the real thing:
+//
+// - The loader: V2 decodes ONLY `mod.default` and requires `{ id: string,
+//   setup: function }` (or `effect`). `assertLoadable` checks exactly that.
+// - The provider registry: rebuilt on every read by replaying registered
+//   transforms in registration order onto a fresh value, seeded from the
+//   configured providers — the same fold opencode does. The config provider's
+//   own transform is modelled as that seed: it runs before any transform this
+//   plugin registers, because the plugin only registers after it has seen the
+//   configured provider (see src/plugin.ts).
+// - `editor.models.update` seeds a missing model from the real
+//   `Model.Info.default`, imported from `@opencode/plugin`, so field defaults
+//   cannot drift from opencode's.
+// - Events: only what the test emits. Real opencode emits `provider.updated`
+//   after any registry change; the plugin's own `reload()` does NOT emit here,
+//   so a loop it would cause in production is caught by the fetch count, not
+//   by a hang.
+//
+// CAVEAT: this is a model of opencode 2.0.32, not opencode itself. The real
+// load is part of the release checks (AGENTS.md, test/probe/README.md).
 
-import type { Plugin, PluginInput } from '@opencode-ai/plugin'
+import { Model } from '@opencode/plugin'
+import type { Plugin, Provider } from '@opencode/plugin'
+import type { ProviderEditor, ProviderRecord } from '@opencode/plugin/promise/provider'
 
 // --- the loader -----------------------------------------------------------
 
-/*
- * Extracted verbatim from the shipped opencode 1.18.6 binary
- * (/opt/homebrew/Cellar/opencode/1.18.6/bin/opencode). `lM` is a typeof
- * check, `ak` normalises an export to a plugin function, `ok` is the loop:
- *
- *   function lM($){return typeof $==="function"}
- *   function ak($){if(lM($))return $;if(!$||typeof $!=="object"||!("server"in $))return;
- *     if(!lM($.server))return;return $.server}
- *   function ok($){let Z=new Set,Q=[];for(let Y of Object.values($)){if(Z.has(Y))continue;
- *     Z.add(Y);let J=ak(Y);if(!J)throw TypeError("Plugin export is not a function");
- *     Q.push(J)}return Q}
- *
- * CAVEAT: this is a model of opencode 1.18.6, not opencode itself. If a
- * future release changes how plugins are loaded, this fake drifts and starts
- * giving false confidence. The minified source above is kept alongside so
- * the drift is auditable — re-extract it with:
- *
- *   strings -a "$(readlink -f "$(which opencode)")" \
- *     | grep -o '.\{700\}Plugin export is not a function.\{200\}'
- *
- * Loading the plugin in a real opencode remains part of the release checks.
- */
-
-/** opencode's `ak`: a plugin export is a function, or an object with `.server`. */
-function asPluginFunction(value: unknown): Plugin | undefined {
-  if (typeof value === 'function') return value as Plugin
-  if (!value || typeof value !== 'object' || !('server' in value)) return undefined
-  const server = (value as { server: unknown }).server
-  if (typeof server !== 'function') return undefined
-  return server as Plugin
-}
-
 /**
- * opencode's `ok`: every runtime export of the entry module must be a plugin
- * function. Throws exactly what opencode throws, so a failure here reads the
- * same as the failure a user reports.
+ * opencode 2.0.32's `PluginModule.load`: `Schema.decodeUnknownEffect(Module)`
+ * over the imported module, where `Module` is `{ default: { id: string,
+ * effect: fn } | { id: string, setup: fn } }`. Throws the message opencode
+ * reports, so a failure here reads the same as the one a user would see.
  */
-export function loadPlugins(mod: object): Plugin[] {
-  const seen = new Set<unknown>()
-  const plugins: Plugin[] = []
-  for (const value of Object.values(mod)) {
-    if (seen.has(value)) continue
-    seen.add(value)
-    const fn = asPluginFunction(value)
-    if (!fn) throw new TypeError('Plugin export is not a function')
-    plugins.push(fn)
+export function assertLoadable(mod: Record<string, unknown>): Plugin.Plugin {
+  const def = mod.default as Record<string, unknown> | undefined
+  if (
+    !def ||
+    typeof def !== 'object' ||
+    typeof def.id !== 'string' ||
+    (typeof def.setup !== 'function' && typeof def.effect !== 'function')
+  ) {
+    throw new Error('Plugin must export a default definition with an id and an effect or setup function.')
   }
-  return plugins
+  return def as unknown as Plugin.Plugin
 }
 
-// --- the plugin input -----------------------------------------------------
+// --- the registry ---------------------------------------------------------
 
-/**
- * A `/v1/model/info` payload: one row per deployment, `model_name` carrying the
- * public model-group name (the same string `/v1/models` reports) and
- * `model_info` carrying LiteLLM's resolved price-map entry, with costs stated
- * in USD per TOKEN.
- *
- * `litellm_params` is present because the real response carries it; the plugin
- * reads `model_name` and `model_info` only, and a fixture that omitted it could
- * not catch a reader that started depending on it.
- */
-export const MODEL_INFO = {
-  data: [
-    {
-      model_name: 'azure-gpt-5.4',
-      litellm_params: { model: 'azure/gpt-5.4' },
-      model_info: {
-        mode: 'chat',
-        max_input_tokens: 922000,
-        max_output_tokens: 128000,
-        max_tokens: 128000,
-        input_cost_per_token: 0.0000025,
-        output_cost_per_token: 0.000015,
-        cache_read_input_token_cost: 0.00000025,
-        input_cost_per_token_above_200k_tokens: 0.000005,
-        output_cost_per_token_above_200k_tokens: 0.0000225,
-        cache_read_input_token_cost_above_200k_tokens: 0.0000005,
-        supports_function_calling: true,
-        supports_reasoning: true,
-        supports_vision: true,
-        supports_pdf_input: true,
-      },
-    },
-  ],
+/** A provider as opencode.json defines it, after V1→V2 normalization. */
+export interface ConfiguredProvider {
+  id: string
+  name?: string
+  package?: string
+  settings?: Record<string, unknown>
+  headers?: Record<string, string>
+  /** `providers.<id>.models` — the user's hand-curated entries, by id → name. */
+  models?: Record<string, string>
 }
 
-/** Every `client.app.log` body the plugin wrote, in order. */
-export interface LoggedEntry {
-  service: string
-  level: string
-  message: string
+export type FoldedRecord = { provider: Provider.Info; models: Map<string, Model.Info> }
+
+export interface FakeHost {
+  ctx: Plugin.Context
+  /** Replace the configured providers, as a config edit would. */
+  configure(providers: ConfiguredProvider[]): void
+  /** Deliver an event to every live `event.subscribe` iterator. */
+  emit(type: string): void
+  /** The registry as the next read would see it. */
+  fold(): Map<string, FoldedRecord>
+  /** Live transform registrations. */
+  readonly transforms: number
+  /** Live event subscriptions. */
+  readonly subscribers: number
+  /** Every `event.subscribe` call so far, live or not. */
+  readonly subscriptions: number
+  /** End every live event stream normally, as a dropped connection would. */
+  endStreams(): void
+  /**
+   * Injected host failures, consumed one per call: the next N
+   * `provider.transform` registrations reject, the next N subscriptions throw
+   * on their first read.
+   */
+  faults: { transform: number; subscribe: number }
+  /** Called after each `provider.list()` resolves its value — for timing tests. */
+  onList?: () => void
 }
 
-/**
- * The members this plugin touches are `client.provider.list({})`,
- * `client.config.providers({})` and `client.app.log({...})` — the last being
- * the only path into opencode's own log file. Everything else on PluginInput is
- * left off and the whole thing cast, so a test fails loudly if the plugin ever
- * starts reaching for something new rather than silently reading `undefined`.
- *
- * Note this stub cannot verify the *shape* of the app.log call: it is
- * hand-written, so it matches whatever the plugin does. `tsc --noEmit` against
- * the real SDK types is what guards that.
- */
-export function fakePluginInput(
-  providers: unknown[],
-  opts: {
-    logged?: LoggedEntry[]
-    logFails?: boolean
-    /** What /provider serves. Omit to serve the same list as config.providers. */
-    all?: unknown[]
-    /** Drop /provider entirely, as an older opencode would. */
-    noProviderList?: boolean
-  } = {},
-): PluginInput {
-  const provider = opts.noProviderList
-    ? undefined
-    : { list: async () => ({ data: { all: opts.all ?? providers } }) }
+/** Build the seed the config provider's transform would produce. */
+function seed(providers: ConfiguredProvider[]): Map<string, FoldedRecord> {
+  const records = new Map<string, FoldedRecord>()
+  for (const p of providers) {
+    const provider = {
+      id: p.id,
+      name: p.name ?? p.id,
+      activation: 'enabled',
+      package: p.package ?? '',
+      ...(p.settings ? { settings: structuredClone(p.settings) } : {}),
+      ...(p.headers ? { headers: { ...p.headers } } : {}),
+    } as unknown as Provider.Info
+    const models = new Map<string, Model.Info>()
+    for (const [id, name] of Object.entries(p.models ?? {})) {
+      models.set(id, { ...Model.Info.default(p.id as Provider.ID, id as Model.ID), name })
+    }
+    records.set(p.id, { provider, models })
+  }
+  return records
+}
+
+/** The editor opencode hands a provider transform, over `records`. */
+function editorOver(records: Map<string, FoldedRecord>): ProviderEditor {
+  const entry = (id: string): FoldedRecord => {
+    let record = records.get(id)
+    if (!record) {
+      record = {
+        provider: { id, name: id, activation: 'auto', package: '' } as unknown as Provider.Info,
+        models: new Map(),
+      }
+      records.set(id, record)
+    }
+    return record
+  }
   return {
-    client: {
-      provider,
-      config: {
-        providers: async () => ({ data: { providers } }),
+    list: () => [...records.values()] as unknown as readonly ProviderRecord[],
+    get: (id) => records.get(id) as unknown as ProviderRecord | undefined,
+    add: () => {
+      throw new Error('fake host: the plugin must not replace a provider record with add()')
+    },
+    update: (id, update) => {
+      const record = entry(id)
+      update(record.provider as never)
+      ;(record.provider as { id: string }).id = id
+    },
+    remove: (id) => void records.delete(id),
+    models: {
+      set: () => {
+        throw new Error('fake host: the plugin must not replace an inventory with models.set()')
       },
-      app: {
-        log: async (options: { body: LoggedEntry }) => {
-          if (opts.logFails) throw new Error('log endpoint unavailable')
-          opts.logged?.push(options.body)
-          return {}
-        },
+      update: (providerID, modelID, update) => {
+        const record = entry(providerID)
+        const current = record.models.get(modelID)
+        const model = current
+          ? structuredClone(current)
+          : Model.Info.default(providerID as Provider.ID, modelID as Model.ID)
+        update(model as never)
+        ;(model as { id: string }).id = modelID
+        ;(model as { providerID: string }).providerID = providerID
+        record.models.set(modelID, model)
+      },
+      remove: (providerID, modelID) => void records.get(providerID)?.models.delete(modelID),
+    },
+  }
+}
+
+export function fakeHost(initial: ConfiguredProvider[] = []): FakeHost {
+  let configured = initial
+  const transforms: Array<(editor: ProviderEditor) => void> = []
+  const queues = new Set<{ push: (type: string) => void; close: () => void }>()
+  const faults = { transform: 0, subscribe: 0 }
+  let subscriptions = 0
+  let host: FakeHost
+
+  const fold = () => {
+    const records = seed(configured)
+    for (const transform of transforms) transform(editorOver(records))
+    return records
+  }
+
+  const ctx = {
+    provider: {
+      // `available()` in opencode: every enabled provider, post-fold.
+      list: async () => {
+        const value = {
+          location: { directory: '/fake' },
+          data: [...fold().values()].map((r) => r.provider),
+        }
+        host.onList?.()
+        return value
+      },
+      transform: async (callback: (editor: ProviderEditor) => void) => {
+        if (faults.transform > 0) {
+          faults.transform--
+          throw new Error('fake host: transform registration refused')
+        }
+        transforms.push(callback)
+        return {
+          dispose: async () => {
+            const i = transforms.indexOf(callback)
+            if (i >= 0) transforms.splice(i, 1)
+          },
+        }
+      },
+      reload: async () => {},
+    },
+    event: {
+      subscribe: ({ signal }: { signal?: AbortSignal } = {}) => {
+        subscriptions++
+        if (faults.subscribe > 0) {
+          faults.subscribe--
+          return (async function* () {
+            throw new Error('fake host: event stream broke')
+          })()
+        }
+        const pending: string[] = []
+        let wake: (() => void) | undefined
+        let closed = false
+        const queue = {
+          push: (type: string) => {
+            pending.push(type)
+            wake?.()
+          },
+          close: () => {
+            closed = true
+            queues.delete(queue)
+            wake?.()
+          },
+        }
+        queues.add(queue)
+        signal?.addEventListener('abort', () => {
+          queues.delete(queue)
+          queue.close()
+        })
+        return (async function* () {
+          while (!closed) {
+            if (pending.length === 0) {
+              await new Promise<void>((resolve) => (wake = resolve))
+              wake = undefined
+              continue
+            }
+            yield { type: pending.shift()!, data: {} }
+          }
+        })()
       },
     },
-  } as unknown as PluginInput
+  }
+
+  host = {
+    // Everything else on the V2 context is left off and the whole thing cast,
+    // so a test fails loudly if the plugin ever reaches for something new.
+    ctx: ctx as unknown as Plugin.Context,
+    configure: (providers) => {
+      configured = providers
+    },
+    emit: (type) => {
+      for (const queue of queues) queue.push(type)
+    },
+    fold,
+    get transforms() {
+      return transforms.length
+    },
+    get subscribers() {
+      return queues.size
+    },
+    get subscriptions() {
+      return subscriptions
+    },
+    endStreams: () => {
+      for (const queue of [...queues]) queue.close()
+    },
+    faults,
+  }
+  return host
 }
 
 // --- the proxy ------------------------------------------------------------
 
 /** A route handler: return a Response, or throw to simulate an unreachable proxy. */
-export type Route = () => Response | Promise<Response>
+export type Route = (signal?: AbortSignal) => Response | Promise<Response>
 
 /** Keyed by URL pathname, e.g. '/v1/models' or '/v1/model/info'. */
 export type Routes = Record<string, Route>
@@ -168,12 +285,12 @@ export function json(body: unknown, status = 200): Response {
 }
 
 /**
- * Every URL the fake proxy was asked for during the current `withFakeProxy`,
- * in order. A route that throws is NOT an assertion — the plugin swallows a
+ * Every request the fake proxy saw during the current `withFakeProxy`, in
+ * order. A route that throws is NOT an assertion — the plugin swallows a
  * failed /v1/model/info on purpose — so "this path must not be fetched" has to
  * be checked here rather than left to a throw nobody observes.
  */
-export const fetchedURLs: string[] = []
+export const fetched: Array<{ url: string; headers: Record<string, string> }> = []
 
 /**
  * Swap `globalThis.fetch` for a router over `routes` for the duration of
@@ -183,13 +300,13 @@ export const fetchedURLs: string[] = []
  */
 export async function withFakeProxy<T>(routes: Routes, fn: () => Promise<T>): Promise<T> {
   const real = globalThis.fetch
-  fetchedURLs.length = 0
-  const stub = async (input: unknown): Promise<Response> => {
+  fetched.length = 0
+  const stub = async (input: unknown, init?: RequestInit): Promise<Response> => {
     const url = new URL(String(input))
-    fetchedURLs.push(url.href)
+    fetched.push({ url: url.href, headers: { ...(init?.headers as Record<string, string>) } })
     const route = routes[url.pathname]
     if (!route) throw new Error(`fake proxy: no route for ${url.pathname}`)
-    return route()
+    return route(init?.signal ?? undefined)
   }
   globalThis.fetch = stub as unknown as typeof globalThis.fetch
   try {
@@ -199,29 +316,21 @@ export async function withFakeProxy<T>(routes: Routes, fn: () => Promise<T>): Pr
   }
 }
 
-// --- console --------------------------------------------------------------
+// --- reporting ------------------------------------------------------------
 
-export interface Captured<T> {
-  result: T
+export interface Reported {
   logs: string[]
   warns: string[]
+  report: (level: 'info' | 'warn', message: string) => void
 }
 
-/**
- * Capture what the plugin reports at startup — its summary line is a
- * documented diagnostic, so it is worth asserting — and keep the suite quiet.
- */
-export async function captureConsole<T>(fn: () => Promise<T>): Promise<Captured<T>> {
+/** A `report` sink for `setupLiteLLMPricing` that keeps the suite quiet. */
+export function reported(): Reported {
   const logs: string[] = []
   const warns: string[] = []
-  const realLog = console.log
-  const realWarn = console.warn
-  console.log = (...args: unknown[]) => void logs.push(args.map(String).join(' '))
-  console.warn = (...args: unknown[]) => void warns.push(args.map(String).join(' '))
-  try {
-    return { result: await fn(), logs, warns }
-  } finally {
-    console.log = realLog
-    console.warn = realWarn
+  return {
+    logs,
+    warns,
+    report: (level, message) => void (level === 'warn' ? warns : logs).push(message),
   }
 }
