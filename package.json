@@ -42,10 +42,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "dependencies": {
-    "@opencode/plugin": "2.0.32"
-  },
   "devDependencies": {
+    "@opencode/plugin": "2.0.32",
     "@types/node": "26.6.4",
     "typescript": "7.0.2"
   }

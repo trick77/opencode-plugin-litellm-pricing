@@ -176,6 +176,7 @@ matching provider the plugin does nothing.
 
 - OpenCode 2 (tested on 2.0.32). OpenCode 1 needs 0.9.0.
 - Node 22+ (development only — OpenCode runs the plugin itself)
+- No runtime dependencies: `@opencode/plugin` is used for types only.
 - A reachable LiteLLM proxy, **v1.96.0 or newer**. That release moved
   `/model/info` and `/v1/model/info` into `llm_api_routes`, so an ordinary
   virtual key can read pricing; before it, only a key with admin-shaped

@@ -10,8 +10,12 @@ OpenCode **2** plugin (V2 API, `@opencode/plugin`) that injects per-model
 - Ships raw TS: `main` is `src/index.ts` (OpenCode/bun runs it). Every relative
   import MUST carry a `.ts` extension (`./types.ts`) — enabled by
   `allowImportingTsExtensions`. Extensionless imports break the node test runner.
-- Entry `src/index.ts`: V2 decodes ONLY `default` = `Plugin.define({ id, setup })`.
-  Types via `export type *`, NEVER `export *` (a leaked value broke 0.2.0).
+- Entry `src/index.ts`: V2 decodes ONLY `default` = plain `{ id, setup }`
+  `satisfies Plugin.Plugin`. Types via `export type *`, NEVER `export *` (a
+  leaked value broke 0.2.0).
+- ZERO runtime deps. `@opencode/plugin` is a devDependency, `import type` ONLY
+  in `src/` — no `Plugin.define`, no `Model.Info.default`. Tests may import
+  values. Check: `npm ls --omit=dev` lists no `@opencode/*`.
 - Root `index.ts` re-exports it: a local DIRECTORY plugin resolves `<dir>/server`
   then `<dir>/index` by path, never package.json `exports`. Npm installs use
   `exports`.

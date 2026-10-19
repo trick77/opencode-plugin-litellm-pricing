@@ -42,8 +42,10 @@
 // A V1-shaped `provider.litellm` block with `npm` + `options` works too:
 // opencode normalizes it into the shape above before any plugin sees it.
 
-import { Plugin } from '@opencode/plugin'
-import type { Model } from '@opencode/plugin'
+// Types only. Nothing from @opencode/* is imported at runtime: the package is a
+// devDependency, so the published plugin has no runtime dependencies at all
+// and cannot clash with the @opencode/plugin copy opencode itself ships.
+import type { Model, Plugin } from '@opencode/plugin'
 import type { ProviderEditor } from '@opencode/plugin/promise/provider'
 import type { DeepMutable } from '@opencode/plugin/promise/types'
 import type { LiteLLMModel, LiteLLMModelInfo, ModelSpec } from './types.ts'
@@ -545,12 +547,15 @@ function consoleReport(level: 'info' | 'warn', message: string): void {
   }
 }
 
-export const LiteLLMPricingPlugin = Plugin.define({
+// A plain object, not `Plugin.define(...)`: `define` is an identity function,
+// and calling it would be the one runtime import of @opencode/plugin. The
+// `satisfies` gives the same type check against V2's definition shape.
+export const LiteLLMPricingPlugin = {
   id: PLUGIN_ID,
-  setup(ctx) {
+  setup(ctx: Plugin.Context) {
     const plugin = setupLiteLLMPricing(ctx)
     // Transforms are disposed by opencode with the plugin; the event
     // subscription and any in-flight discovery are ours to stop.
     return () => plugin.dispose()
   },
-})
+} satisfies Plugin.Plugin
