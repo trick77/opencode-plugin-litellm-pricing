@@ -79,6 +79,18 @@ export interface FakeHost {
   readonly transforms: number
   /** Live event subscriptions. */
   readonly subscribers: number
+  /** Every `event.subscribe` call so far, live or not. */
+  readonly subscriptions: number
+  /** End every live event stream normally, as a dropped connection would. */
+  endStreams(): void
+  /**
+   * Injected host failures, consumed one per call: the next N
+   * `provider.transform` registrations reject, the next N subscriptions throw
+   * on their first read.
+   */
+  faults: { transform: number; subscribe: number }
+  /** Called after each `provider.list()` resolves its value — for timing tests. */
+  onList?: () => void
 }
 
 /** Build the seed the config provider's transform would produce. */
@@ -151,6 +163,9 @@ export function fakeHost(initial: ConfiguredProvider[] = []): FakeHost {
   let configured = initial
   const transforms: Array<(editor: ProviderEditor) => void> = []
   const queues = new Set<{ push: (type: string) => void; close: () => void }>()
+  const faults = { transform: 0, subscribe: 0 }
+  let subscriptions = 0
+  let host: FakeHost
 
   const fold = () => {
     const records = seed(configured)
@@ -161,11 +176,19 @@ export function fakeHost(initial: ConfiguredProvider[] = []): FakeHost {
   const ctx = {
     provider: {
       // `available()` in opencode: every enabled provider, post-fold.
-      list: async () => ({
-        location: { directory: '/fake' },
-        data: [...fold().values()].map((r) => r.provider),
-      }),
+      list: async () => {
+        const value = {
+          location: { directory: '/fake' },
+          data: [...fold().values()].map((r) => r.provider),
+        }
+        host.onList?.()
+        return value
+      },
       transform: async (callback: (editor: ProviderEditor) => void) => {
+        if (faults.transform > 0) {
+          faults.transform--
+          throw new Error('fake host: transform registration refused')
+        }
         transforms.push(callback)
         return {
           dispose: async () => {
@@ -178,6 +201,13 @@ export function fakeHost(initial: ConfiguredProvider[] = []): FakeHost {
     },
     event: {
       subscribe: ({ signal }: { signal?: AbortSignal } = {}) => {
+        subscriptions++
+        if (faults.subscribe > 0) {
+          faults.subscribe--
+          return (async function* () {
+            throw new Error('fake host: event stream broke')
+          })()
+        }
         const pending: string[] = []
         let wake: (() => void) | undefined
         let closed = false
@@ -188,6 +218,7 @@ export function fakeHost(initial: ConfiguredProvider[] = []): FakeHost {
           },
           close: () => {
             closed = true
+            queues.delete(queue)
             wake?.()
           },
         }
@@ -210,7 +241,7 @@ export function fakeHost(initial: ConfiguredProvider[] = []): FakeHost {
     },
   }
 
-  return {
+  host = {
     // Everything else on the V2 context is left off and the whole thing cast,
     // so a test fails loudly if the plugin ever reaches for something new.
     ctx: ctx as unknown as Plugin.Context,
@@ -227,13 +258,21 @@ export function fakeHost(initial: ConfiguredProvider[] = []): FakeHost {
     get subscribers() {
       return queues.size
     },
+    get subscriptions() {
+      return subscriptions
+    },
+    endStreams: () => {
+      for (const queue of [...queues]) queue.close()
+    },
+    faults,
   }
+  return host
 }
 
 // --- the proxy ------------------------------------------------------------
 
 /** A route handler: return a Response, or throw to simulate an unreachable proxy. */
-export type Route = () => Response | Promise<Response>
+export type Route = (signal?: AbortSignal) => Response | Promise<Response>
 
 /** Keyed by URL pathname, e.g. '/v1/models' or '/v1/model/info'. */
 export type Routes = Record<string, Route>
@@ -267,7 +306,7 @@ export async function withFakeProxy<T>(routes: Routes, fn: () => Promise<T>): Pr
     fetched.push({ url: url.href, headers: { ...(init?.headers as Record<string, string>) } })
     const route = routes[url.pathname]
     if (!route) throw new Error(`fake proxy: no route for ${url.pathname}`)
-    return route()
+    return route(init?.signal ?? undefined)
   }
   globalThis.fetch = stub as unknown as typeof globalThis.fetch
   try {

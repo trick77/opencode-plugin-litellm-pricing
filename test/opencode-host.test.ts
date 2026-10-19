@@ -357,7 +357,12 @@ test('a failed discovery is not retried immediately', async () => {
       after: async (host, plugin) => {
         host.emit('provider.updated')
         await settle(plugin)
-        assert.equal(fetched.length, 1, 'retry must wait for the backoff window')
+        // One attempt = both endpoints, requested together.
+        assert.equal(
+          fetched.filter((f) => f.url.endsWith('/v1/models')).length,
+          1,
+          'retry must wait for the backoff window',
+        )
       },
     },
   )
@@ -643,4 +648,203 @@ test('a provider removed from the config is not recreated by the transform', asy
       assert.equal(host.fold().has(PROVIDER_KEY), false)
     },
   })
+})
+
+// --- failure handling and lifecycle -------------------------------------------
+//
+// Short timings so retries and resubscriptions happen within a test. The real
+// values (60s retry floor, 1s–60s resubscribe backoff) only differ in size.
+
+const FAST = { retryAfterMs: 20, resubscribeMinMs: 5, resubscribeMaxMs: 20 }
+
+/** Poll `done` until it holds, letting the plugin settle in between. */
+async function waitFor(done: () => boolean, plugin: { idle: () => Promise<void> }, what: string) {
+  const deadline = Date.now() + 2000
+  while (!done()) {
+    if (Date.now() > deadline) assert.fail(`timed out waiting for: ${what}`)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await plugin.idle()
+  }
+}
+
+type PluginHandle = ReturnType<typeof setupLiteLLMPricing>
+
+/** Set up with FAST timings against `providers`, run `body`, always dispose. */
+async function withPlugin(
+  providers: ConfiguredProvider[],
+  routes: Routes,
+  body: (host: FakeHost, plugin: PluginHandle, out: ReturnType<typeof reported>) => Promise<void>,
+  prepare?: (host: FakeHost) => void,
+) {
+  const out = reported()
+  const host = fakeHost(providers)
+  prepare?.(host)
+  await withFakeProxy(routes, async () => {
+    const plugin = setupLiteLLMPricing(host.ctx, out.report, FAST)
+    try {
+      await body(host, plugin, out)
+    } finally {
+      plugin.dispose()
+      await plugin.idle()
+    }
+  })
+}
+
+// A rejected registration used to escape discover(), leave the attempt marked
+// in flight forever and `registered` already true — so the transform was never
+// registered and the provider never retried.
+test('a refused transform registration is reported and retried, not wedged', async () => {
+  await withPlugin(
+    [provider('https://proxy-refused.test/v1')],
+    PROXY_ROUTES,
+    async (host, plugin, out) => {
+      await settle(plugin)
+      assert.equal(host.transforms, 0)
+      assert.ok(
+        out.warns.some((w) => w.includes('could not apply discovered models')),
+        `expected the refusal reported, got: ${out.warns.join(' | ')}`,
+      )
+      await waitFor(() => modelsOf(host.fold()).has('ai-gateway-gpt-5.4'), plugin, 'retry to inject')
+      assert.equal(host.transforms, 1, 'registered exactly once after the retry')
+    },
+    (host) => {
+      host.faults.transform = 1
+    },
+  )
+})
+
+// A proxy down at startup must not leave the picker empty until a restart,
+// and nothing else may be needed to trigger the retry — no provider change.
+test('a proxy down at startup is retried on a timer and recovers', async () => {
+  let up = false
+  await withPlugin(
+    [provider('https://proxy-flaky.test/v1')],
+    {
+      '/v1/models': () => {
+        if (!up) throw new Error('ECONNREFUSED')
+        return modelsResponse(CHAT_MODEL)
+      },
+      '/v1/model/info': modelInfoRoute(['ai-gateway-gpt-5.4', GPT_54_INFO]),
+    },
+    async (host, plugin, out) => {
+      await settle(plugin)
+      assert.ok(out.warns.some((w) => w.includes('Model discovery failed')))
+      up = true
+      await waitFor(() => modelsOf(host.fold()).has('ai-gateway-gpt-5.4'), plugin, 'timer retry')
+    },
+  )
+})
+
+// The lost wakeup: an event arriving after the sync loop has decided to stop
+// but before `running` was cleared raised `again` for a loop that no longer
+// read it. Delivered at every microtask offset across the tail of a sync, a
+// config change must always be acted on.
+test('a provider change during the tail of a sync is never dropped', async () => {
+  for (let depth = 0; depth < 40; depth++) {
+    const a = provider(`https://proxy-wake-a${depth}.test/v1`)
+    const b = provider(`https://proxy-wake-b${depth}.test/v1`)
+    await withPlugin([a], PROXY_ROUTES, async (host, plugin) => {
+      await settle(plugin)
+      host.onList = () => {
+        host.onList = undefined
+        let n = depth
+        const tick = (): void => {
+          if (n-- > 0) return queueMicrotask(tick)
+          host.configure([b])
+          host.emit('provider.updated')
+        }
+        tick()
+      }
+      host.emit('provider.updated')
+      await settle(plugin)
+      await settle(plugin)
+      assert.ok(
+        fetched.some((f) => f.url.includes(`proxy-wake-b${depth}.test`)),
+        `change at microtask offset ${depth} was dropped`,
+      )
+    })
+  }
+})
+
+test('a broken event stream is reported once and resubscribed', async () => {
+  await withPlugin(
+    [],
+    PROXY_ROUTES,
+    async (host, plugin, out) => {
+      await waitFor(() => host.subscribers === 1, plugin, 'resubscribe after two failures')
+      assert.equal(host.subscriptions, 3)
+      assert.equal(out.warns.filter((w) => w.includes('event stream')).length, 1, out.warns.join(' | '))
+
+      // An ended stream (no error) is resubscribed too.
+      host.endStreams()
+      await waitFor(() => host.subscribers === 1 && host.subscriptions === 4, plugin, 'resubscribe after end')
+
+      // And the new subscription works.
+      host.configure([provider('https://proxy-resub.test/v1')])
+      host.emit('provider.updated')
+      await waitFor(() => modelsOf(host.fold()).has('ai-gateway-gpt-5.4'), plugin, 'discovery via new stream')
+    },
+    (host) => {
+      host.faults.subscribe = 2
+    },
+  )
+})
+
+test('dispose aborts in-flight requests and skips the remaining providers', async () => {
+  let aborted = false
+  let started!: () => void
+  const inFlight = new Promise<void>((resolve) => (started = resolve))
+  const hanging = (signal?: AbortSignal) =>
+    new Promise<Response>((_, reject) => {
+      started()
+      signal?.addEventListener('abort', () => {
+        aborted = true
+        reject(signal.reason)
+      })
+    })
+  await withPlugin(
+    [provider('https://proxy-hang.test/v1'), provider('https://proxy-next.test/v1', { id: 'litellm' })],
+    {
+      '/v1/models': hanging,
+      '/v1/model/info': hanging,
+    },
+    async (host, plugin, out) => {
+      await inFlight
+      plugin.dispose()
+      await plugin.idle()
+      assert.equal(aborted, true, 'the in-flight request should be aborted')
+      assert.equal(
+        fetched.some((f) => f.url.includes('proxy-next.test')),
+        false,
+        'the next provider must not be fetched',
+      )
+      assert.equal(host.transforms, 0)
+      assert.deepEqual(out.warns, [], 'an unload is not a discovery failure')
+    },
+  )
+})
+
+test('/v1/models and /v1/model/info are requested concurrently', async () => {
+  let infoRequested!: () => void
+  const info = new Promise<void>((resolve) => (infoRequested = resolve))
+  await withPlugin(
+    [provider('https://proxy-parallel.test/v1')],
+    {
+      // Answers only once /v1/model/info has also been asked for — a
+      // sequential implementation times out here and injects nothing.
+      '/v1/models': async () => {
+        const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('sequential')), 500))
+        await Promise.race([info, timeout])
+        return modelsResponse(CHAT_MODEL)
+      },
+      '/v1/model/info': () => {
+        infoRequested()
+        return modelInfoRoute(['ai-gateway-gpt-5.4', GPT_54_INFO])()
+      },
+    },
+    async (host, plugin) => {
+      await waitFor(() => modelsOf(host.fold()).has('ai-gateway-gpt-5.4'), plugin, 'parallel discovery')
+      assert.deepEqual(modelsOf(host.fold()).get('ai-gateway-gpt-5.4')!.cost, GPT_54_COST)
+    },
+  )
 })

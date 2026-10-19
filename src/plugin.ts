@@ -88,12 +88,32 @@ const REASONING_EFFORTS = ['low', 'medium', 'high'] as const
 const UNPRICED_LIST_LIMIT = 15
 
 /**
- * A failed discovery is retried on the next provider change, but no sooner
- * than this. opencode is a long-running service in V2: a proxy that was down
+ * A failed discovery is retried on a timer after this long (or on the next
+ * provider change, but never sooner). opencode is a long-running service in V2: a proxy that was down
  * at startup must not leave the picker empty until a restart, and a proxy
  * that stays down must not be hammered on every unrelated reload.
  */
 const RETRY_AFTER_MS = 60_000
+
+/**
+ * Backoff for resubscribing to opencode's event stream after it errored or
+ * ended. Doubles per failure, capped; reset by the first event that arrives.
+ */
+const RESUBSCRIBE_MIN_MS = 1_000
+const RESUBSCRIBE_MAX_MS = 60_000
+
+/** Timing knobs — overridden by tests only. */
+export interface Timing {
+  retryAfterMs: number
+  resubscribeMinMs: number
+  resubscribeMaxMs: number
+}
+
+const DEFAULT_TIMING: Timing = {
+  retryAfterMs: RETRY_AFTER_MS,
+  resubscribeMinMs: RESUBSCRIBE_MIN_MS,
+  resubscribeMaxMs: RESUBSCRIBE_MAX_MS,
+}
 
 /**
  * Does a provider id / settings block designate a LiteLLM-backed provider?
@@ -129,8 +149,10 @@ function applySpec(model: DeepMutable<Model.Info>, spec: ModelSpec): void {
   model.name = spec.name
   // V2's limit fields are integers; LiteLLM's are in practice, but a stray
   // float must not make opencode reject the whole model.
-  if (spec.limit?.context != null) model.limit.context = Math.trunc(spec.limit.context)
-  if (spec.limit?.output != null) model.limit.output = Math.trunc(spec.limit.output)
+  if (spec.limit) {
+    model.limit.context = Math.trunc(spec.limit.context)
+    model.limit.output = Math.trunc(spec.limit.output)
+  }
   model.capabilities.input = [...spec.input]
   if (spec.tools !== undefined) model.capabilities.tools = spec.tools
   // Fresh tier objects per model: one spec is never shared between two
@@ -211,7 +233,11 @@ export function buildInjection(
  * The plugin body. Exported separately from the definition so tests can drive
  * it with a fake context.
  */
-export function setupLiteLLMPricing(ctx: Plugin.Context, report: Report = consoleReport) {
+export function setupLiteLLMPricing(
+  ctx: Plugin.Context,
+  report: Report = consoleReport,
+  timing: Timing = DEFAULT_TIMING,
+) {
   // Why this is not "read the config, fetch, inject" any more:
   //
   // In V2 there is no mutable config object to rewrite. Providers come from
@@ -246,10 +272,19 @@ export function setupLiteLLMPricing(ctx: Plugin.Context, report: Report = consol
   const warnedStale = new Set<string>()
   let registered = false
   let disposed = false
+  // Aborts the event subscription and every in-flight proxy request.
+  const controller = new AbortController()
+  // One pending retry at a time; unref'd so it never keeps a process alive.
+  let retryTimer: ReturnType<typeof setTimeout> | undefined
 
   // The transform. Replayed by opencode on every rebuild, so it reads only
   // the captured `injections` and writes only to the editor (plus `stats`,
   // which is a pure function of the fold and read back for the log).
+  //
+  // `stats` stays, even though it is a side channel: which discovered ids the
+  // user already hand-curated is only knowable inside the fold —
+  // `ctx.provider.list()` returns provider infos without their models. Deriving
+  // the summary from the injection alone would count curated models as added.
   const transform = (editor: ProviderEditor) => {
     stats.clear()
     for (const [providerId, injection] of injections) {
@@ -341,8 +376,24 @@ export function setupLiteLLMPricing(ctx: Plugin.Context, report: Report = consol
     }
   }
 
-  // Discover one provider. Never throws: every failure is reported and leaves
-  // the previous inventory (if any) in place.
+  // A failed attempt is retried on a timer, not only on the next provider
+  // change: a proxy that was down when opencode started must not leave the
+  // picker empty until a restart. The retry floor in `syncOnce` still applies.
+  const scheduleRetry = (ms: number) => {
+    if (disposed || retryTimer) return
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined
+      sync()
+    }, ms)
+    retryTimer.unref?.()
+  }
+  const fail = (providerId: string, key: string) => {
+    attempts.set(providerId, { key, failedAt: Date.now() })
+    scheduleRetry(timing.retryAfterMs)
+  }
+
+  // Discover one provider. Never throws: every failure is reported, recorded
+  // as failed (so it is retried) and leaves the previous inventory in place.
   const discover = async (
     providerId: string,
     key: string,
@@ -352,13 +403,22 @@ export function setupLiteLLMPricing(ctx: Plugin.Context, report: Report = consol
   ): Promise<void> => {
     attempts.set(providerId, { key })
 
-    // No standalone health probe: /v1/models is the same request a probe
-    // would make, and its failure already means "offline".
+    // Both requests at once. /v1/models is the gate — its failure means
+    // "offline" (no standalone health probe: it is the same request a probe
+    // would make). /v1/model/info is best-effort by necessity: a proxy older
+    // than LiteLLM v1.96.0, or a key scoped to exclude the route, refuses it.
+    // Every model is still injected then — unpriced, and classified by the
+    // `mode` on /v1/models if it carries one, else by the id heuristics.
     let discovered: LiteLLMModel[]
+    let infoByName: Map<string, LiteLLMModelInfo> | null
     try {
-      discovered = await discoverLiteLLMModels(baseURL, apiKey, headers)
+      ;[discovered, infoByName] = await Promise.all([
+        discoverLiteLLMModels(baseURL, apiKey, headers, controller.signal),
+        discoverLiteLLMModelInfo(baseURL, apiKey, headers, controller.signal).catch(() => null),
+      ])
     } catch (err) {
-      attempts.set(providerId, { key, failedAt: Date.now() })
+      if (disposed) return
+      fail(providerId, key)
       report(
         'warn',
         `[litellm-pricing] Model discovery failed for provider "${providerId}" at ${baseURL}: ` +
@@ -366,8 +426,9 @@ export function setupLiteLLMPricing(ctx: Plugin.Context, report: Report = consol
       )
       return
     }
+    if (disposed) return
     if (discovered.length === 0) {
-      attempts.set(providerId, { key, failedAt: Date.now() })
+      fail(providerId, key)
       report(
         'warn',
         `[litellm-pricing] LiteLLM responded for provider "${providerId}" but exposed zero models.`,
@@ -375,35 +436,43 @@ export function setupLiteLLMPricing(ctx: Plugin.Context, report: Report = consol
       return
     }
 
-    // What each model costs, what kind of model it is, and what it can do.
-    // Best-effort by necessity: a proxy older than LiteLLM v1.96.0, or a key
-    // scoped to exclude the route, refuses it. Every model is still injected
-    // in that case — unpriced, and classified by the `mode` on /v1/models if
-    // it carries one, else by the id heuristics.
-    let infoByName: Map<string, LiteLLMModelInfo> | null = null
-    try {
-      infoByName = await discoverLiteLLMModelInfo(baseURL, apiKey, headers)
-    } catch {
-      infoByName = null
-    }
-    if (disposed) return
-
     const injection = buildInjection(key, baseURL, discovered, infoByName)
+    const previous = injections.get(providerId)
     injections.set(providerId, injection)
-    if (!registered) {
-      registered = true
-      await ctx.provider.transform(transform)
-    } else {
-      await ctx.provider.reload()
+    try {
+      if (!registered) {
+        await ctx.provider.transform(transform)
+        // Only now: a registration that failed must be retried, not assumed.
+        registered = true
+      } else {
+        await ctx.provider.reload()
+      }
+      // A read forces the rebuild, so `stats` reflects this injection.
+      await ctx.provider.list()
+    } catch (err) {
+      // opencode refused the registration or the rebuild. Roll back so the
+      // key does not read as "done", and retry like any other failure.
+      if (previous) injections.set(providerId, previous)
+      else injections.delete(providerId)
+      if (disposed) return
+      fail(providerId, key)
+      report(
+        'warn',
+        `[litellm-pricing] provider "${providerId}": could not apply discovered models: ` +
+          (err instanceof Error ? err.message : String(err)),
+      )
+      return
     }
-    // A read forces the rebuild, so `stats` reflects this injection.
-    await ctx.provider.list()
+    attempts.delete(providerId)
     summarize(providerId, injection, infoByName !== null)
   }
 
   const syncOnce = async () => {
     const listed = await ctx.provider.list()
     for (const provider of listed.data) {
+      // Unloaded mid-sync: stop before the next provider, not after all of
+      // them. In-flight requests are aborted through `controller`.
+      if (disposed) return
       const providerId = provider.id
       const settings = (provider.settings ?? {}) as Record<string, unknown>
       if (!isLiteLLMProvider(providerId, settings)) continue
@@ -471,7 +540,14 @@ export function setupLiteLLMPricing(ctx: Plugin.Context, report: Report = consol
       const attempt = attempts.get(providerId)
       if (attempt?.key === key) {
         if (attempt.failedAt === undefined) continue // in flight
-        if (Date.now() - attempt.failedAt < RETRY_AFTER_MS) continue
+        const elapsed = Date.now() - attempt.failedAt
+        if (elapsed < timing.retryAfterMs) {
+          // Too early — but never just skip: a timer can fire a millisecond
+          // ahead of `Date.now()`, and a skipped retry with nothing scheduled
+          // would wedge the provider until the next config change.
+          scheduleRetry(timing.retryAfterMs - elapsed + 1)
+          continue
+        }
       }
 
       // No outer race: every await inside `discover()` is individually bounded
@@ -482,39 +558,79 @@ export function setupLiteLLMPricing(ctx: Plugin.Context, report: Report = consol
 
   // One sync at a time; a provider change arriving mid-sync schedules exactly
   // one more pass instead of a second concurrent one.
+  //
+  // `running` is cleared in the same synchronous step that reads `again` as
+  // false (the `finally` below runs with no await in between). Clearing it a
+  // microtask later, in a `.finally()` chained on the promise, let an event
+  // land in between, see `running` still set, raise `again` after the loop had
+  // stopped reading it — and get dropped.
   let running: Promise<void> | undefined
   let again = false
+  const loop = async () => {
+    try {
+      do {
+        again = false
+        try {
+          await syncOnce()
+        } catch (err) {
+          if (disposed) return
+          report(
+            'warn',
+            `[litellm-pricing] provider sync failed: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        }
+      } while (again && !disposed)
+    } finally {
+      running = undefined
+    }
+  }
   const sync = () => {
     if (disposed) return
     if (running) {
       again = true
       return
     }
-    running = (async () => {
-      do {
-        again = false
-        await syncOnce()
-      } while (again && !disposed)
-    })()
-      .catch((err) => {
-        report(
-          'warn',
-          `[litellm-pricing] provider sync failed: ${err instanceof Error ? err.message : String(err)}`,
-        )
-      })
-      .finally(() => {
-        running = undefined
-      })
+    running = loop()
   }
 
-  const controller = new AbortController()
+  // Follow `provider.updated` for the plugin's whole life. An error or an
+  // ended stream is not the end: it is logged once and the subscription is
+  // re-opened with backoff, followed by a sync to catch up on whatever was
+  // missed meanwhile. Only an abort (the plugin being unloaded) ends it.
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms)
+      timer.unref?.()
+      controller.signal.addEventListener('abort', () => {
+        clearTimeout(timer)
+        resolve()
+      })
+    })
+  let warnedStream = false
   void (async () => {
-    for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-      if (event.type === 'provider.updated') sync()
+    let delay = timing.resubscribeMinMs
+    while (!disposed) {
+      let problem: string
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          delay = timing.resubscribeMinMs
+          if (event.type === 'provider.updated') sync()
+        }
+        problem = 'ended'
+      } catch (err) {
+        problem = `failed: ${err instanceof Error ? err.message : String(err)}`
+      }
+      if (disposed) return
+      if (!warnedStream) {
+        warnedStream = true
+        report('warn', `[litellm-pricing] opencode event stream ${problem}; resubscribing`)
+      }
+      await sleep(delay)
+      delay = Math.min(delay * 2, timing.resubscribeMaxMs)
+      sync()
     }
-  })().catch(() => {
-    // An aborted subscription is the normal end of it.
-  })
+  })()
+
   // Covers a host where the provider is already registered when this plugin
   // loads (and every test): a no-op when nothing matches yet.
   sync()
@@ -526,6 +642,8 @@ export function setupLiteLLMPricing(ctx: Plugin.Context, report: Report = consol
     },
     dispose: () => {
       disposed = true
+      if (retryTimer) clearTimeout(retryTimer)
+      retryTimer = undefined
       controller.abort()
     },
   }

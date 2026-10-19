@@ -89,7 +89,17 @@ user's real service/config/logs.
   discovered URL. Rewriting from a stale injection hides a config edit and sends
   traffic to the old proxy.
 - Re-discover only when (baseURL, key, headers) change; our own `reload()`
-  re-fires `provider.updated` → anything else loops. Failure → retry after 60s.
+  re-fires `provider.updated` → anything else loops. Failure (fetch, zero
+  models, refused transform/reload) → `failedAt` + unref'd retry timer, 60s
+  floor; a skipped early retry re-arms the timer (timers fire ~1ms early). NO
+  periodic re-discovery of a healthy proxy (undecided).
+- `running` cleared in the loop's own `finally` — a `.finally()` chained on the
+  promise drops events landing in between (lost wakeup, tested).
+- Event stream error/end → warn once, resubscribe with backoff, then sync.
+  Dispose aborts in-flight fetches (`controller.signal`) and stops between
+  providers.
+- `limit` only when BOTH sides known: one side + V2 default (200k/32k) can put
+  output above a small context → every request 400s.
 - `/v1/models` on current LiteLLM carries `mode`/`max_input_tokens`/
   `max_output_tokens` (never cost); older proxies return
   `id/object/created/owned_by` alone. `enrichModel` fills the gaps from the

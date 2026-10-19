@@ -140,8 +140,8 @@ export interface CostTier {
  */
 export interface ModelSpec {
   name: string
-  /** Each side only when the proxy reported it. */
-  limit?: { context?: number; output?: number }
+  /** Only when the proxy reported both sides. */
+  limit?: { context: number; output: number }
   /** `undefined` when the proxy did not say — opencode's default then stands. */
   tools?: boolean
   /** Always starts with `'text'`. */

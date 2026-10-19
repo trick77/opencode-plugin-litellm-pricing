@@ -144,14 +144,14 @@ export function modelSpecFromProxy(
 
   // LiteLLM semantics: max_input_tokens = context window; max_output_tokens
   // = max completion; max_tokens is the legacy alias of max_output_tokens
-  // (NOT total context). Each side is set only when known: an unknown side
-  // keeps opencode's `Model.Info.default` value instead of a bogus 0.
+  // (NOT total context). Both sides or neither: mixing one known side with
+  // opencode's `Model.Info.default` for the other (200k / 32k) can produce an
+  // output limit above the context window — a small model would then reject
+  // every request with a 400. Neither known → opencode's defaults stand.
   const context = model.max_input_tokens
   const output = model.max_output_tokens ?? model.max_tokens
-  if (context != null || output != null) {
-    spec.limit = {}
-    if (context != null) spec.limit.context = context
-    if (output != null) spec.limit.output = output
+  if (context != null && output != null) {
+    spec.limit = { context, output }
   }
 
   // Tool calling is stated only when the proxy said so either way. V2's

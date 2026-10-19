@@ -62,8 +62,9 @@ e.g. for Cloudflare Access.
 Discovery runs in the background once OpenCode has loaded the provider, and
 again whenever its URL, key or headers change. The very first model list a
 freshly started OpenCode serves can come back before the proxy has answered;
-the models are there from the next request on. A proxy
-that is down is retried on the next provider change, at most once a minute.
+the models are there from the next request on. A proxy that is down (or
+answers with no models) is retried once a minute until it answers; a proxy
+that answered is not polled again until the provider's settings change.
 
 ### Upgrading
 

@@ -104,10 +104,14 @@ test('a chat model with "audio" in its id is NOT hidden when mode is absent', ()
   assert.equal(spec!.name, 'GPT 4o Audio Preview')
 })
 
-test('limit sets each known side only; max_tokens is the output fallback', () => {
-  // Only max_output known → only output set; context keeps opencode's default.
+test('limit is emitted only with both sides known; max_tokens is the output fallback', () => {
+  // One side alone would be paired with opencode's default for the other
+  // (200k context / 32k output). A small known context with the default 32k
+  // output asks for more tokens than the window holds → every request 400s.
+  const contextOnly = { id: 'm0', object: 'model', mode: 'chat', max_input_tokens: 8192 } as LiteLLMModel
+  assert.equal(modelSpecFromProxy(contextOnly, undefined)!.limit, undefined)
   const outputOnly = { id: 'm', object: 'model', mode: 'chat', max_output_tokens: 4096 } as LiteLLMModel
-  assert.deepEqual(modelSpecFromProxy(outputOnly, undefined)!.limit, { output: 4096 })
+  assert.equal(modelSpecFromProxy(outputOnly, undefined)!.limit, undefined)
   // max_tokens is LiteLLM's legacy alias for max output, used as the fallback
   // — and never as the context window.
   const withMaxTokens = {
