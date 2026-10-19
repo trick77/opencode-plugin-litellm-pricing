@@ -1,6 +1,7 @@
 # AGENTS.md
 
-OpenCode plugin that injects per-model **cost** for LiteLLM proxy models.
+OpenCode **2** plugin (V2 API, `@opencode/plugin`) that injects per-model
+**cost** for LiteLLM proxy models. V1 support dropped at 1.0.0 (0.9.0 = last V1).
 
 ## Build / test
 
@@ -9,44 +10,40 @@ OpenCode plugin that injects per-model **cost** for LiteLLM proxy models.
 - Ships raw TS: `main` is `src/index.ts` (OpenCode/bun runs it). Every relative
   import MUST carry a `.ts` extension (`./types.ts`) — enabled by
   `allowImportingTsExtensions`. Extensionless imports break the node test runner.
-- Entry module `src/index.ts`: EVERY runtime export must be a plugin function.
-  OpenCode's loader iterates `Object.values(mod)` and throws "Plugin export is
-  not a function" on anything else. Re-export types with `export type *`, NEVER
-  `export *` — a leaked value (`LITELLM_CHAT_MODES`) broke 0.2.0, invisible to
-  `tsc` and to every unit test.
-- `test/opencode-host.test.ts` runs the plugin through a fake OpenCode loader +
-  stubbed proxy (`test/helpers/fake-opencode-host.ts`, modelled on opencode
-  1.18.6). Change loader/hook behaviour → update it. Give each scenario its OWN
-  baseURL: `injectedModelIds` is unreset module state, so a shared URL sends the
-  second scenario down the early-return, passing having done nothing. Helpers in
-  `test/helpers/` so the `test/*.test.ts` glob skips them.
-- Harness runs on NODE; OpenCode runs BUN. Touching `src/index.ts` exports or
-  anything transpiler-sensitive → also load for real: scratch dir with
-  `"plugin": ["file:///<abs-path-to-checkout>"]` (no LiteLLM provider needed),
-  `opencode models --print-logs`, confirm no `failed to load plugin`. Never
-  `--pure` — skips external plugins.
+- Entry `src/index.ts`: V2 decodes ONLY `default` = `Plugin.define({ id, setup })`.
+  Types via `export type *`, NEVER `export *` (a leaked value broke 0.2.0).
+- Root `index.ts` re-exports it: a local DIRECTORY plugin resolves `<dir>/server`
+  then `<dir>/index` by path, never package.json `exports`. Npm installs use
+  `exports`.
+- `test/opencode-host.test.ts`: fake V2 ctx + replaying provider registry +
+  stubbed proxy (`test/helpers/fake-opencode-host.ts`, modelled on 2.0.32).
+  Change registry/event behaviour → update it. Helpers in `test/helpers/` so the
+  `test/*.test.ts` glob skips them.
+- Harness runs on NODE; OpenCode runs BUN. Touching exports, startup or the
+  transform → run the probe (below). Never `--pure` — skips external plugins.
 
 ## The probe — USE IT for anything startup-related
 
-`npm test` calls the `config` hook directly → blind to startup: hook invocation
-count, client-call timing, prices reaching the picker. Use
-`test/probe/` (its README has the commands): `node test/probe/fake-proxy.mjs`,
-then `cd test/probe && opencode models`.
+`test/probe/README.md` has the commands. Throwaway `HOME` ALWAYS — never the
+user's real service/config/logs.
 
-- `config` hook invoked EXACTLY ONCE (verified: `serve` + CLI). Never design
-  around "a later pass fixes it up".
-- NEVER await an opencode client call during plugin load — server can't answer
-  while a plugin blocks it. Awaited `config.providers`/`provider.list` timed out
-  at 60s; unawaited returned in 351ms, after the hook ran. Cost every price.
-- Ground truth = `/config/providers`, not stdout. A log line proves code ran,
-  not that the price reached the picker.
+- Config provider plugin activates AFTER user plugins (`post` in core
+  `plugin/internal.ts`). In `setup` the LiteLLM provider does not exist. NEVER
+  await discovery or the provider inside `setup` — activation is sequential,
+  that deadlocks. Discovery starts on `provider.updated`.
+- Transforms are SYNC + replayed on every rebuild: read captured data only, no
+  I/O, no logging. Register the provider transform late (first discovery) so it
+  folds after the config provider and sees user-curated models.
+- First read of a fresh location can beat discovery (measured 2.0.32). Not a bug
+  to "fix" with blocking.
+- Ground truth = `opencode api model.list -H x-opencode-directory:$PWD`, not
+  stdout. Without the header `opencode api` hits `$HOME`'s location.
 
 ## Cost mapping — load-bearing rules
 
-- OpenCode config `cost` is FLAT and closed:
-  `{ input, output, cache_read, cache_write, context_over_200k }`,
-  `additionalProperties:false`. NEVER emit a nested `cache` object — the schema
-  rejects it and the whole `cost` is dropped. Values are USD per 1M tokens.
+- V2 `Model.Info.cost` = ARRAY of tiers `{ tier?, input, output, cache: { read,
+  write } }`, USD per 1M. `cache.read`/`write` REQUIRED → unknown = 0 (as core's
+  V1 migration does). `[]` = unpriced.
 - ONE cost source: `/v1/model/info` on the configured proxy, keyed by
   `model_name` = the `/v1/models` id. Costs are per-TOKEN — they MUST go through
   `buildCost`/`perMillion` (×1e6). No price table, no `catalogURL`, no disk
@@ -62,15 +59,14 @@ then `cd test/probe && opencode models`.
   `base_model` must not price the whole group at nothing.
 - A deployment with no `base_model` mapping resolves to NO cost fields, not to
   0 — so it injects unpriced and gets named in the log. Never invent a fallback.
-- NEVER go back to `client.config.providers()` for cost: deadlocks (above), and
-  lists only the reader's configured providers — no Azure creds → no `azure`,
-  and its `openai` entry reports every cost as 0 → real models priced $0.
-- Emit `cost` only when both `input` and `output` are known. Keep a real `0`
-  (free tier); drop only absent values.
-- Build `cost` fresh per entry — one info object serves several ids; a shared
-  block (nested `context_over_200k` included) aliases into opencode's config.
-- Tiering: map LiteLLM `*_above_200k_tokens` → `context_over_200k`. Do NOT map
-  `*_above_272k_tokens` (would overcharge the 200k–272k band).
+- NEVER take cost from opencode's own provider/model lists: they list only the
+  reader's configured providers, and report missing costs as 0 → real models
+  priced $0.
+- A tier only when both `input` and `output` are known. Keep a real `0` (free
+  tier).
+- Build tiers fresh per model — one info object serves several ids.
+- Tiering: LiteLLM `*_above_200k_tokens` → second tier `{type:"context",
+  size:200000}`. Do NOT map `*_above_272k_tokens` (overcharges 200k–272k).
 - Pin prices against fixtures only — never against live upstream data.
 
 ## LiteLLM field semantics
@@ -82,8 +78,14 @@ then `cd test/probe && opencode models`.
 
 ## Discovery rules
 
-- `options.baseURL` is REQUIRED. No default URL, no port probing, never
-  localhost. Missing → warn and skip the provider.
+- `settings.baseURL` (V1 `options.*` normalizes to `settings.*`) is REQUIRED. No
+  default URL, no port probing, never localhost. Missing → warn once, skip.
+- Transform rewrites provider `settings.baseURL` to `<normalized>/v1` (the route
+  POSTs `${baseURL}/chat/completions`) — ONLY while it still matches the
+  discovered URL. Rewriting from a stale injection hides a config edit and sends
+  traffic to the old proxy.
+- Re-discover only when (baseURL, key, headers) change; our own `reload()`
+  re-fires `provider.updated` → anything else loops. Failure → retry after 60s.
 - `/v1/models` on current LiteLLM carries `mode`/`max_input_tokens`/
   `max_output_tokens` (never cost); older proxies return
   `id/object/created/owned_by` alone. `enrichModel` fills the gaps from the
@@ -99,15 +101,15 @@ then `cd test/probe && opencode models`.
   `null`/absent → next signal. LiteLLM really does emit `mode: null`.
 - Id heuristics stay narrow — a false positive HIDES a working chat model.
   Never match bare `nova` / `e5` / `gte` / `audio`.
-- Never overwrite a user-curated `provider.*.models` entry.
+- Never overwrite a user-curated `providers.*.models` entry.
 - Provider ids matched: `opencode-plugin-litellm-pricing` (package name),
   `opencode-litellm-pricing` (pre-0.3.0 name — user config, never drop it),
-  `litellm`, `litellm-*`/`litellm_*`, `options.litellm*` flags.
-- Report via `report()` in `plugin.ts` → console AND `client.app.log`. console
-  alone never reaches `~/.local/share/opencode/log/opencode.log`. Never await
-  that log call; never let it break config loading.
-- Fail soft: warn and continue; never throw out of the `config` hook. Skip
-  malformed entries and wildcard (`*`) ids.
+  `litellm`, `litellm-*`/`litellm_*`, `settings.litellm*` flags.
+- `report()` = console only: V2 has no plugin logger, no `client.app.log`.
+  Service mode DISCARDS it (not in opencode.log, measured 2.0.32); visible under
+  foreground `opencode serve`.
+- Fail soft: warn and continue; never throw out of discovery or a transform.
+  Skip malformed entries and wildcard (`*`) ids.
 
 ## Release
 

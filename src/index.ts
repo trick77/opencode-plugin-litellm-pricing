@@ -1,6 +1,9 @@
-export { LiteLLMPricingPlugin } from './plugin.ts'
-// `export type *`, not `export *`: opencode's plugin loader requires every
-// runtime export of this module to be a plugin function. types.ts exports a
-// value (LITELLM_CHAT_MODES), and re-exporting it here broke 0.2.0 with
-// "Plugin export is not a function". The type form is erased at compile time.
+import { LiteLLMPricingPlugin } from './plugin.ts'
+
+// opencode V2 reads exactly one thing off this module: the default export,
+// which must carry an `id` and a `setup` function (`Plugin.define` in
+// plugin.ts type-checks that shape). Named exports are ignored by the V2
+// loader, but stay types-only all the same: `export type *` is erased at
+// compile time, so no stray value (`LITELLM_CHAT_MODES`) is ever exported.
+export default LiteLLMPricingPlugin
 export type * from './types.ts'

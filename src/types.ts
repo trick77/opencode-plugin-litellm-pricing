@@ -2,7 +2,7 @@
 //
 // Models the subset of LiteLLM's OpenAI-compatible /v1/models and
 // /v1/model/info payloads the plugin needs — including the price-map entry
-// shape the cost fields for opencode's per-model `cost` block are read from.
+// shape the cost fields for opencode's per-model `cost` tiers are read from.
 
 /**
  * A single model entry returned by LiteLLM's `/v1/models` endpoint.
@@ -70,8 +70,8 @@ export interface LiteLLMModelInfo {
   cache_read_input_token_cost?: number
   cache_creation_input_token_cost?: number
   // Tiered pricing above a 200k-token context. LiteLLM also exposes
-  // *_above_272k_tokens for some Azure/OpenAI models, but opencode only
-  // models a fixed 200k boundary, so we map only the matching 200k tier.
+  // *_above_272k_tokens for some Azure/OpenAI models; only the 200k tier is
+  // mapped (see `buildCost` for why).
   input_cost_per_token_above_200k_tokens?: number | null
   output_cost_per_token_above_200k_tokens?: number | null
   cache_read_input_token_cost_above_200k_tokens?: number | null
@@ -113,28 +113,50 @@ export const LITELLM_CHAT_MODES: ReadonlySet<string> = new Set(['chat', 'complet
 export type ModelType = 'chat' | 'embedding' | 'image' | 'audio' | 'unknown'
 
 /**
- * A single opencode cost tier. Values are USD per 1M tokens. `input` and
- * `output` are required by opencode's schema; cache fields are optional.
+ * One opencode V2 cost tier (`Model.Cost`). Values are USD per 1M tokens.
+ *
+ * Structurally `Model.Cost` from `@opencode/plugin` minus the `Money` brand —
+ * the brand is a compile-time tag only, so the transform casts at the one
+ * place these land in a `Model.Info`.
+ *
+ * `cache.read` / `cache.write` are REQUIRED by V2's schema, unlike V1's flat
+ * optional `cache_read` / `cache_write`. An unknown cache price is written as
+ * `0` — the same default opencode's own config migration applies.
+ *
+ * The base tier carries no `tier`; the tier for prompts above 200k tokens
+ * carries `{ type: 'context', size: 200000 }`.
  */
 export interface CostTier {
+  tier?: { type: 'context'; size: number }
   input: number
   output: number
-  cache_read?: number
-  cache_write?: number
+  cache: { read: number; write: number }
 }
 
 /**
- * opencode config-level `cost` block (as it appears in
- * `provider.*.models.*.cost` in opencode.json), with optional tiered
- * pricing for contexts over 200k tokens.
+ * What the plugin knows about one discovered model, ready to be written onto
+ * a `Model.Info` draft by the provider transform. Anything absent keeps
+ * opencode's `Model.Info.default` value rather than an invented one.
  */
-export interface CostBlock extends CostTier {
-  context_over_200k?: CostTier
+export interface ModelSpec {
+  name: string
+  /** Each side only when the proxy reported it. */
+  limit?: { context?: number; output?: number }
+  /** `undefined` when the proxy did not say — opencode's default then stands. */
+  tools?: boolean
+  /** Always starts with `'text'`. */
+  input: Array<'text' | 'image' | 'pdf' | 'audio'>
+  /** True → the model gets low/medium/high `reasoningEffort` variants. */
+  reasoning: boolean
+  /** `[]` = unpriced. Otherwise the base tier first, then the >200k tier. */
+  cost: CostTier[]
 }
 
 /**
- * Options accepted on a matched LiteLLM provider's `options` block. `baseURL`
- * is the only required one — pricing comes from the proxy it names.
+ * Settings read off a matched LiteLLM provider. In V2 these live under
+ * `providers.<id>.settings`; a V1 `provider.<id>.options` block is normalized
+ * into the same place by opencode. `baseURL` is the only required one —
+ * pricing comes from the proxy it names.
  */
 export interface LiteLLMOptions {
   baseURL?: string

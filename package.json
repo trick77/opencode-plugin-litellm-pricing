@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-plugin-litellm-pricing",
-  "version": "0.9.0",
-  "description": "OpenCode plugin: dynamic LiteLLM model discovery with real per-model pricing, read from the proxy's own /v1/model/info",
+  "version": "1.0.0",
+  "description": "OpenCode 2 plugin: dynamic LiteLLM model discovery with real per-model pricing, read from the proxy's own /v1/model/info",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
@@ -43,8 +43,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.4",
-    "@opencode-ai/sdk": "^1.18.4"
+    "@opencode/plugin": "2.0.32"
   },
   "devDependencies": {
     "@types/node": "26.6.4",
