@@ -47,7 +47,6 @@
 // and cannot clash with the @opencode/plugin copy opencode itself ships.
 import type { Model, Plugin } from '@opencode/plugin'
 import type { ProviderEditor } from '@opencode/plugin/promise/provider'
-import type { DeepMutable } from '@opencode/plugin/promise/types'
 import type { LiteLLMModel, LiteLLMModelInfo, ModelSpec } from './types.ts'
 import {
   discoverLiteLLMModelInfo,
@@ -144,8 +143,15 @@ function readHeaders(raw: unknown): Record<string, string> | undefined {
   return Object.keys(out).length > 0 ? out : undefined
 }
 
+/**
+ * The mutable `Model.Info` draft `editor.models.update` hands out. Read off
+ * the editor, not imported: 2.2 dropped `promise/types` and moved the helper
+ * into `effect`, which is not ours to depend on.
+ */
+type ModelDraft = Parameters<Parameters<ProviderEditor['models']['update']>[2]>[0]
+
 /** Write a spec onto a `Model.Info` draft seeded by opencode. */
-function applySpec(model: DeepMutable<Model.Info>, spec: ModelSpec): void {
+function applySpec(model: ModelDraft, spec: ModelSpec): void {
   model.name = spec.name
   // V2's limit fields are integers; LiteLLM's are in practice, but a stray
   // float must not make opencode reject the whole model.
@@ -158,7 +164,7 @@ function applySpec(model: DeepMutable<Model.Info>, spec: ModelSpec): void {
   // Fresh tier objects per model: one spec is never shared between two
   // drafts, but a copy keeps that true even if it ever is. The cast only
   // drops the `Money` brand (see `CostTier` in types.ts).
-  model.cost = spec.cost.map((tier) => structuredClone(tier)) as unknown as DeepMutable<Model.Cost>[]
+  model.cost = spec.cost.map((tier) => structuredClone(tier)) as unknown as ModelDraft['cost']
   if (spec.reasoning) {
     model.variants = REASONING_EFFORTS.map((effort) => ({
       id: effort as Model.VariantID,
