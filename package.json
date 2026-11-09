@@ -43,7 +43,7 @@
     "access": "public"
   },
   "devDependencies": {
-    "@opencode/plugin": "2.2.3",
+    "@opencode/plugin": "2.2.5",
     "@types/node": "26.6.6",
     "typescript": "7.0.2"
   }
